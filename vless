@@ -326,7 +326,6 @@ EOF
     chmod 600 "$XRAY_DIR/keys.txt"
 }
 
-# 配置 Xray 服务器
 configure_xray_server() {
     yellow "[*] 配置 Xray 服务器..."
     
@@ -427,7 +426,15 @@ EOF
 
     # 设置权限
     chmod 644 "$XRAY_DIR/config.json"
-    
+
+    # 下载 geoip.dat 和 geosite.dat
+    wget -O "$XRAY_DIR/geoip.dat" https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+    wget -O "$XRAY_DIR/geosite.dat" https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+
+    # 建立软链到 /usr/local/bin/ 以防找不到
+    ln -sf "$XRAY_DIR/geoip.dat" /usr/local/bin/geoip.dat
+    ln -sf "$XRAY_DIR/geosite.dat" /usr/local/bin/geosite.dat
+
     # 验证配置
     if /usr/local/bin/xray -test -config="$XRAY_DIR/config.json"; then
         green "[*] Xray 配置验证成功"
