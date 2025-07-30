@@ -732,7 +732,7 @@ EOF
 # 创建管理脚本
 create_management_tools() {
     yellow "[*] 创建管理工具..."
-
+    
     # 主管理脚本
     cat > /usr/local/bin/vless-mgr <<'EOF'
 #!/bin/bash
@@ -823,20 +823,22 @@ case "$1" in
     *)
         echo "VLESS Reality 管理工具"
         echo ""
-        echo "用法: vless-mgr {command}"
+        echo "用法: vless-mgr {status|config|qr|logs|restart}"
         echo ""
-        echo "命令:"
-        echo "  status / st          查看服务状态和连接情况"
-        echo "  config / cfg         查看客户端配置信息"
-        echo "  qr                   显示分享二维码"
-        echo "  logs / log [access|error|live] 查看日志"
-        echo "  restart / rs         重启服务"
+        echo "命令说明:"
+        echo "  status / st      查看服务状态和统计"
+        echo "  config / cfg     查看客户端配置信息"
+        echo "  qr               显示分享链接二维码"
+        echo "  logs / log       查看日志 (access/error/live)"
+        echo "  restart / rs     重启 Xray 服务"
         ;;
 esac
 EOF
 
     chmod +x /usr/local/bin/vless-mgr
+}
 
+# 主流程
 main() {
     detect_system
     install_dependencies
@@ -852,5 +854,9 @@ main() {
     generate_client_configs
     optimize_system
     create_management_tools
+
+    green "[✔] VLESS Reality 安装完成！"
+    echo "管理命令: vless-mgr"
 }
+
 main
