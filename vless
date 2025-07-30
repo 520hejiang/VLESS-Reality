@@ -836,8 +836,8 @@ esac
 EOF
 
     chmod +x /usr/local/bin/vless-mgr
-）
-main() 
+
+main() {
     detect_system
     install_dependencies
     get_server_ip
@@ -854,4 +854,4 @@ main()
     create_management_tools
 }
 
-main}
+main
