@@ -732,7 +732,7 @@ EOF
 # 创建管理脚本
 create_management_tools() {
     yellow "[*] 创建管理工具..."
-    
+
     # 主管理脚本
     cat > /usr/local/bin/vless-mgr <<'EOF'
 #!/bin/bash
@@ -823,4 +823,17 @@ case "$1" in
     *)
         echo "VLESS Reality 管理工具"
         echo ""
-        echo "用法: vless-mgr {comma
+        echo "用法: vless-mgr {command}"
+        echo ""
+        echo "命令:"
+        echo "  status / st          查看服务状态和连接情况"
+        echo "  config / cfg         查看客户端配置信息"
+        echo "  qr                   显示分享二维码"
+        echo "  logs / log [access|error|live] 查看日志"
+        echo "  restart / rs         重启服务"
+        ;;
+esac
+EOF
+
+    chmod +x /usr/local/bin/vless-mgr
+}
