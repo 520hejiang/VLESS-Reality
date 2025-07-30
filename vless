@@ -836,4 +836,22 @@ esac
 EOF
 
     chmod +x /usr/local/bin/vless-mgr
+）
+main() 
+    detect_system
+    install_dependencies
+    get_server_ip
+    select_camouflage_domain
+    select_reality_target
+    install_xray
+    generate_keys
+    configure_xray_server
+    configure_nginx_camouflage
+    create_systemd_service
+    configure_firewall
+    generate_client_configs
+    optimize_system
+    create_management_tools
 }
+
+main}
