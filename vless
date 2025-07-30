@@ -1,0 +1,826 @@
+#!/bin/bash
+
+export LANG=en_US.UTF-8
+
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+PURPLE="\033[35m"
+CYAN="\033[36m"
+PLAIN="\033[0m"
+
+red() { echo -e "${RED}$1${PLAIN}"; }
+green() { echo -e "${GREEN}$1${PLAIN}"; }
+yellow() { echo -e "${YELLOW}$1${PLAIN}"; }
+blue() { echo -e "${BLUE}$1${PLAIN}"; }
+purple() { echo -e "${PURPLE}$1${PLAIN}"; }
+cyan() { echo -e "${CYAN}$1${PLAIN}"; }
+
+# 配置目录
+XRAY_DIR="/usr/local/etc/xray"
+CLIENT_DIR="/root/vless-clients"
+LOG_FILE="/var/log/xray/access.log"
+ERROR_LOG="/var/log/xray/error.log"
+NGINX_CONF_DIR="/etc/nginx"
+
+# Reality 目标网站池 (知名网站，流量特征相似)
+REALITY_TARGETS=(
+    "www.microsoft.com:443"
+    "www.apple.com:443" 
+    "www.cloudflare.com:443"
+    "www.github.com:443"
+    "www.docker.com:443"
+    "www.ubuntu.com:443"
+    "www.mozilla.org:443"
+    "nodejs.org:443"
+)
+
+[[ $EUID -ne 0 ]] && red "[!] 请使用 root 用户运行本脚本！" && exit 1
+
+# 检测系统
+detect_system() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        SYSTEM="$ID"
+        VERSION="$VERSION_ID"
+    else
+        red "[!] 无法检测系统类型"
+        exit 1
+    fi
+
+    case $SYSTEM in
+        "ubuntu"|"debian")
+            PKG_MANAGER="apt"
+            PKG_INSTALL="apt install -y"
+            PKG_UPDATE="apt update -y && apt upgrade -y"
+            ;;
+        "centos"|"rhel"|"fedora"|"rocky"|"almalinux")
+            PKG_MANAGER="yum"
+            PKG_INSTALL="yum install -y"
+            PKG_UPDATE="yum update -y"
+            if [[ $SYSTEM == "centos" ]]; then
+                PKG_INSTALL="yum install -y epel-release && yum install -y"
+            fi
+            ;;
+        *)
+            red "[!] 不支持的系统: $SYSTEM"
+            exit 1
+            ;;
+    esac
+
+    yellow "[*] 检测到系统: $SYSTEM $VERSION"
+}
+
+# 安装依赖
+install_dependencies() {
+    yellow "[*] 更新系统并安装依赖..."
+    
+    $PKG_UPDATE
+    
+    # 基础工具
+    $PKG_INSTALL curl wget unzip tar qrencode nginx certbot \
+                 python3-certbot-nginx ufw fail2ban jq bc \
+                 net-tools dnsutils openssl socat cron
+
+    # 时间同步 (Reality 对时间敏感)
+    $PKG_INSTALL chrony || $PKG_INSTALL ntp
+    systemctl enable --now chronyd 2>/dev/null || systemctl enable --now ntpd
+
+    # 配置 fail2ban
+    if ! systemctl is-active --quiet fail2ban; then
+        systemctl enable --now fail2ban
+        
+        # 配置 Xray 防护规则
+        cat > /etc/fail2ban/filter.d/xray.conf <<EOF
+[Definition]
+failregex = .*rejected.* from <HOST>:.*
+            .*invalid.* from <HOST>:.*
+            .*failed.* from <HOST>:.*
+ignoreregex =
+EOF
+
+        cat > /etc/fail2ban/jail.d/xray.conf <<EOF
+[xray]
+enabled = true
+port = 80,443
+filter = xray
+logpath = $ERROR_LOG
+maxretry = 3
+bantime = 3600
+findtime = 600
+EOF
+        
+        systemctl restart fail2ban
+    fi
+}
+
+# 获取服务器 IP
+get_server_ip() {
+    yellow "[*] 获取服务器公网 IP..."
+    
+    # 多源IP检测，增加可靠性
+    IP_SOURCES=(
+        "https://api.ipify.org"
+        "https://icanhazip.com"
+        "https://ipv4.icanhazip.com"
+        "https://checkip.amazonaws.com"
+        "https://ifconfig.me/ip"
+    )
+    
+    for source in "${IP_SOURCES[@]}"; do
+        SERVER_IP=$(curl -s --connect-timeout 5 --max-time 10 "$source" 2>/dev/null | grep -E '^[0-9.]+$')
+        [[ -n "$SERVER_IP" ]] && break
+    done
+    
+    # IPv6 支持检测
+    SERVER_IPV6=$(curl -s --connect-timeout 5 --max-time 10 "https://ipv6.icanhazip.com" 2>/dev/null | grep -E '^[0-9a-fA-F:]+$')
+    
+    if [[ -z "$SERVER_IP" ]]; then
+        red "[!] 无法获取服务器公网 IP"
+        exit 1
+    fi
+    
+    yellow "[*] 服务器 IPv4: $SERVER_IP"
+    [[ -n "$SERVER_IPV6" ]] && yellow "[*] 服务器 IPv6: $SERVER_IPV6"
+}
+
+# 选择伪装域名
+select_camouflage_domain() {
+    yellow "[*] 选择伪装策略..."
+    
+    echo ""
+    blue "请选择伪装方式:"
+    echo "1) 使用真实域名 (需要域名和证书)"
+    echo "2) 使用 IP 直连 (无需域名，纯 Reality)"
+    echo "3) 自动生成假域名 (推荐)"
+    echo ""
+    
+    read -rp "请选择 [1-3, 默认3]: " camouflage_choice
+    camouflage_choice=${camouflage_choice:-3}
+    
+    case $camouflage_choice in
+        1)
+            read -rp "请输入你的域名: " DOMAIN
+            if [[ -z "$DOMAIN" ]]; then
+                red "[!] 域名不能为空"
+                exit 1
+            fi
+            USE_REAL_DOMAIN=true
+            ;;
+        2)
+            DOMAIN="$SERVER_IP"
+            USE_REAL_DOMAIN=false
+            ;;
+        3)
+            # 生成看起来真实的假域名
+            FAKE_DOMAINS=(
+                "cdn-$((RANDOM % 9999)).cloudfront.net"
+                "api-$((RANDOM % 9999)).amazonaws.com"
+                "static-$((RANDOM % 9999)).googleapis.com"
+                "assets-$((RANDOM % 9999)).github.io"
+                "edge-$((RANDOM % 9999)).fastly.com"
+            )
+            DOMAIN=${FAKE_DOMAINS[$((RANDOM % ${#FAKE_DOMAINS[@]}))]}
+            USE_REAL_DOMAIN=false
+            yellow "[*] 生成的伪装域名: $DOMAIN"
+            ;;
+        *)
+            yellow "[*] 使用默认模式"
+            DOMAIN="$SERVER_IP"
+            USE_REAL_DOMAIN=false
+            ;;
+    esac
+}
+
+# 选择 Reality 目标网站
+select_reality_target() {
+    yellow "[*] 选择 Reality 目标网站..."
+    
+    echo ""
+    blue "可用的目标网站:"
+    for i in "${!REALITY_TARGETS[@]}"; do
+        echo "$((i+1))) ${REALITY_TARGETS[i]}"
+    done
+    echo "$((${#REALITY_TARGETS[@]}+1))) 自定义"
+    echo ""
+    
+    read -rp "请选择目标网站 [1-$((${#REALITY_TARGETS[@]}+1)), 默认1]: " target_choice
+    target_choice=${target_choice:-1}
+    
+    if [[ $target_choice -eq $((${#REALITY_TARGETS[@]}+1)) ]]; then
+        read -rp "请输入自定义目标 (格式: domain:port): " REALITY_TARGET
+        if [[ ! "$REALITY_TARGET" =~ ^[^:]+:[0-9]+$ ]]; then
+            red "[!] 格式错误，使用默认目标"
+            REALITY_TARGET="${REALITY_TARGETS[0]}"
+        fi
+    else
+        REALITY_TARGET="${REALITY_TARGETS[$((target_choice-1))]}"
+    fi
+    
+    REALITY_DEST="${REALITY_TARGET%:*}"
+    REALITY_PORT="${REALITY_TARGET#*:}"
+    
+    yellow "[*] Reality 目标: $REALITY_DEST:$REALITY_PORT"
+    
+    # 测试目标连通性
+    if ! nc -z "$REALITY_DEST" "$REALITY_PORT" 2>/dev/null; then
+        yellow "[!] 警告: 目标网站可能无法访问，但不影响使用"
+    fi
+}
+
+# 安装 Xray
+install_xray() {
+    yellow "[*] 安装 Xray-core..."
+    
+    # 获取最新版本
+    LATEST_VERSION=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name' | sed 's/v//')
+    
+    if [[ -z "$LATEST_VERSION" ]]; then
+        red "[!] 无法获取 Xray 最新版本"
+        exit 1
+    fi
+    
+    yellow "[*] 最新版本: $LATEST_VERSION"
+    
+    # 检测系统架构
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64) ARCH="64" ;;
+        aarch64) ARCH="arm64-v8a" ;;
+        armv7l) ARCH="arm32-v7a" ;;
+        *) red "[!] 不支持的架构: $ARCH"; exit 1 ;;
+    esac
+    
+    # 下载并安装
+    DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/v$LATEST_VERSION/Xray-linux-$ARCH.zip"
+    
+    cd /tmp || exit 1
+    wget -O xray.zip "$DOWNLOAD_URL" || {
+        red "[!] 下载失败，尝试备用源..."
+        wget -O xray.zip "https://ghproxy.com/$DOWNLOAD_URL" || {
+            red "[!] 下载失败"
+            exit 1
+        }
+    }
+    
+    unzip -o xray.zip
+    
+    # 安装文件
+    mkdir -p /usr/local/bin /usr/local/etc/xray /var/log/xray
+    mv xray /usr/local/bin/
+    chmod +x /usr/local/bin/xray
+    
+    # 验证安装
+    if /usr/local/bin/xray version | grep -q "Xray"; then
+        green "[*] Xray 安装成功: $(/usr/local/bin/xray version | head -1)"
+    else
+        red "[!] Xray 安装失败"
+        exit 1
+    fi
+    
+    # 清理临时文件
+    rm -f /tmp/xray.zip /tmp/xray /tmp/geoip.dat /tmp/geosite.dat
+}
+
+# 生成密钥和 UUID
+generate_keys() {
+    yellow "[*] 生成密钥和配置..."
+    
+    # 生成 UUID
+    USER_UUID=$(cat /proc/sys/kernel/random/uuid)
+    
+    # 生成 Reality 密钥对
+    KEY_PAIR=$(/usr/local/bin/xray x25519)
+    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep "Private key:" | awk '{print $3}')
+    PUBLIC_KEY=$(echo "$KEY_PAIR" | grep "Public key:" | awk '{print $3}')
+    
+    # 生成短 ID (8位十六进制)
+    SHORT_ID=$(openssl rand -hex 4)
+    
+    # 生成更安全的端口 (443 或高端口)
+    if ss -tlnp | grep -q ":443 "; then
+        # 443 被占用，使用随机高端口
+        LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
+        while ss -tlnp | grep -q ":$LISTEN_PORT "; do
+            LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
+        done
+    else
+        LISTEN_PORT=443
+    fi
+    
+    yellow "[*] 用户 UUID: $USER_UUID"
+    yellow "[*] 监听端口: $LISTEN_PORT"
+    yellow "[*] Short ID: $SHORT_ID"
+    
+    # 保存密钥信息
+    cat > "$XRAY_DIR/keys.txt" <<EOF
+Private Key: $PRIVATE_KEY
+Public Key: $PUBLIC_KEY
+UUID: $USER_UUID
+Short ID: $SHORT_ID
+Listen Port: $LISTEN_PORT
+Reality Target: $REALITY_DEST:$REALITY_PORT
+Generated: $(date)
+EOF
+    chmod 600 "$XRAY_DIR/keys.txt"
+}
+
+# 配置 Xray 服务器
+configure_xray_server() {
+    yellow "[*] 配置 Xray 服务器..."
+    
+    # 创建配置目录
+    mkdir -p "$XRAY_DIR" /var/log/xray
+    
+    # 生成服务器配置
+    cat > "$XRAY_DIR/config.json" <<EOF
+{
+    "log": {
+        "access": "$LOG_FILE",
+        "error": "$ERROR_LOG",
+        "loglevel": "warning"
+    },
+    "inbounds": [
+        {
+            "port": $LISTEN_PORT,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "$USER_UUID",
+                        "flow": ""
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": "$REALITY_DEST:$REALITY_PORT",
+                    "serverNames": [
+                        "$REALITY_DEST"
+                    ],
+                    "privateKey": "$PRIVATE_KEY",
+                    "shortIds": [
+                        "$SHORT_ID"
+                    ]
+                }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls"]
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "freedom",
+            "settings": {},
+            "tag": "direct"
+        },
+        {
+            "protocol": "blackhole",
+            "settings": {},
+            "tag": "blocked"
+        }
+    ],
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+            {
+                "type": "field",
+                "ip": [
+                    "geoip:private"
+                ],
+                "outboundTag": "blocked"
+            },
+            {
+                "type": "field",
+                "domain": [
+                    "geosite:category-ads-all"
+                ],
+                "outboundTag": "blocked"
+            }
+        ]
+    },
+    "policy": {
+        "levels": {
+            "0": {
+                "handshake": 4,
+                "connIdle": 300,
+                "uplinkOnly": 5,
+                "downlinkOnly": 30,
+                "statsUserUplink": false,
+                "statsUserDownlink": false,
+                "bufferSize": 10240
+            }
+        },
+        "system": {
+            "statsInboundUplink": false,
+            "statsInboundDownlink": false
+        }
+    }
+}
+EOF
+
+    # 设置权限
+    chmod 644 "$XRAY_DIR/config.json"
+    
+    # 验证配置
+    if /usr/local/bin/xray -test -config="$XRAY_DIR/config.json"; then
+        green "[*] Xray 配置验证成功"
+    else
+        red "[!] Xray 配置验证失败"
+        exit 1
+    fi
+}
+
+# 配置 Nginx 伪装 (可选)
+configure_nginx_camouflage() {
+    if [[ "$USE_REAL_DOMAIN" == "true" ]]; then
+        yellow "[*] 配置 Nginx 伪装..."
+        
+        # 申请 SSL 证书
+        certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
+                --email "admin@$DOMAIN" --redirect
+        
+        # 配置 Nginx 反向代理
+        cat > "/etc/nginx/sites-available/$DOMAIN" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+    
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    
+    # 伪装成正常网站
+    location / {
+        proxy_pass https://$REALITY_DEST;
+        proxy_set_header Host $REALITY_DEST;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_ssl_server_name on;
+        proxy_ssl_verify off;
+    }
+    
+    # 隐藏服务器信息
+    server_tokens off;
+    more_set_headers "Server: nginx";
+}
+EOF
+        
+        ln -sf "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/"
+        nginx -t && systemctl reload nginx
+    fi
+}
+
+# 创建 systemd 服务
+create_systemd_service() {
+    yellow "[*] 创建 Xray 系统服务..."
+    
+    cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/xray run -config $XRAY_DIR/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+# 安全设置
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/xray
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable xray
+    
+    if systemctl start xray; then
+        green "[*] Xray 服务启动成功"
+    else
+        red "[!] Xray 服务启动失败"
+        journalctl -u xray --no-pager -n 20
+        exit 1
+    fi
+}
+
+# 配置防火墙
+configure_firewall() {
+    yellow "[*] 配置防火墙..."
+    
+    # UFW 配置
+    if command -v ufw &> /dev/null; then
+        ufw --force reset
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow ssh
+        ufw allow $LISTEN_PORT comment 'VLESS Reality'
+        
+        if [[ "$USE_REAL_DOMAIN" == "true" ]]; then
+            ufw allow 80 comment 'HTTP'
+            ufw allow 443 comment 'HTTPS'
+        fi
+        
+        ufw --force enable
+    fi
+    
+    # iptables 备用规则
+    iptables -I INPUT -p tcp --dport $LISTEN_PORT -j ACCEPT
+    iptables -I INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+    
+    # 保存规则
+    if command -v iptables-save &> /dev/null; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+}
+
+# 生成客户端配置
+generate_client_configs() {
+    yellow "[*] 生成客户端配置..."
+    
+    mkdir -p "$CLIENT_DIR"
+    
+    # 客户端配置 JSON
+    cat > "$CLIENT_DIR/client.json" <<EOF
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "inbounds": [
+        {
+            "port": 1080,
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": {
+                "udp": true
+            }
+        },
+        {
+            "port": 1081,
+            "listen": "127.0.0.1",
+            "protocol": "http"
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "vless",
+            "settings": {
+                "vnext": [
+                    {
+                        "address": "$SERVER_IP",
+                        "port": $LISTEN_PORT,
+                        "users": [
+                            {
+                                "id": "$USER_UUID",
+                                "encryption": "none"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "serverName": "$REALITY_DEST",
+                    "fingerprint": "chrome",
+                    "publicKey": "$PUBLIC_KEY",
+                    "shortId": "$SHORT_ID"
+                }
+            },
+            "tag": "proxy"
+        },
+        {
+            "protocol": "freedom",
+            "tag": "direct"
+        }
+    ],
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "type": "field",
+                "domain": ["geosite:cn"],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "ip": ["geoip:cn", "geoip:private"],
+                "outboundTag": "direct"
+            }
+        ]
+    }
+}
+EOF
+
+    # 生成分享链接
+    VLESS_LINK="vless://$USER_UUID@$SERVER_IP:$LISTEN_PORT?encryption=none&flow=&security=reality&sni=$REALITY_DEST&fp=chrome&pbk=$PUBLIC_KEY&sid=$SHORT_ID&type=tcp&headerType=none#VLESS-Reality-$(date +%s)"
+    
+    echo "$VLESS_LINK" > "$CLIENT_DIR/share-link.txt"
+    
+    # 生成客户端使用说明
+    cat > "$CLIENT_DIR/client-info.txt" <<EOF
+VLESS Reality 客户端信息
+========================
+
+连接信息:
+- 服务器地址: $SERVER_IP
+- 端口: $LISTEN_PORT
+- UUID: $USER_UUID
+- 加密: none
+- 传输协议: tcp
+- 安全层: reality
+- SNI: $REALITY_DEST
+- 指纹: chrome
+- 公钥: $PUBLIC_KEY
+- Short ID: $SHORT_ID
+
+分享链接:
+$VLESS_LINK
+
+客户端配置文件: $CLIENT_DIR/client.json
+
+支持的客户端:
+- v2rayN (Windows)
+- v2rayNG (Android) 
+- Qv2ray (跨平台)
+- Clash Meta (支持 Reality)
+- sing-box (推荐)
+
+本地代理端口:
+- SOCKS5: 127.0.0.1:1080
+- HTTP: 127.0.0.1:1081
+
+生成时间: $(date)
+EOF
+
+    chmod 600 "$CLIENT_DIR"/*
+    
+    green "[*] 客户端配置已生成: $CLIENT_DIR/"
+}
+
+# 系统优化
+optimize_system() {
+    yellow "[*] 优化系统性能..."
+    
+    # 网络参数优化
+    cat >> /etc/sysctl.conf <<EOF
+
+# VLESS Reality 网络优化
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.netdev_max_backlog = 4096
+net.ipv4.tcp_rmem = 4096 65536 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 10
+net.ipv4.ip_forward = 1
+fs.file-max = 1048576
+EOF
+
+    sysctl -p
+    
+    # 设置文件描述符限制
+    cat >> /etc/security/limits.conf <<EOF
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+
+    # 优化 systemd 限制
+    mkdir -p /etc/systemd/system.conf.d
+    cat > /etc/systemd/system.conf.d/limits.conf <<EOF
+[Manager]
+DefaultLimitNOFILE=1048576
+EOF
+
+    systemctl daemon-reload
+}
+
+# 创建管理脚本
+create_management_tools() {
+    yellow "[*] 创建管理工具..."
+    
+    # 主管理脚本
+    cat > /usr/local/bin/vless-mgr <<'EOF'
+#!/bin/bash
+
+XRAY_DIR="/usr/local/etc/xray"
+CLIENT_DIR="/root/vless-clients"
+LOG_FILE="/var/log/xray/access.log"
+ERROR_LOG="/var/log/xray/error.log"
+
+show_status() {
+    echo "=== VLESS Reality 服务状态 ==="
+    systemctl status xray --no-pager -l
+    echo ""
+    echo "=== 连接统计 ==="
+    if [[ -f "$LOG_FILE" ]]; then
+        echo "今日连接数: $(grep "$(date +%Y/%m/%d)" "$LOG_FILE" | wc -l)"
+        echo "活跃IP数: $(tail -1000 "$LOG_FILE" | awk '{print $3}' | sort -u | wc -l)"
+    fi
+    echo ""
+    echo "=== 系统资源 ==="
+    echo "CPU使用率: $(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | awk -F'%' '{print $1}')"
+    echo "内存使用: $(free -h | grep Mem | awk '{print $3"/"$2}')"
+    echo "磁盘使用: $(df -h / | tail -1 | awk '{print $5}')"
+}
+
+show_config() {
+    echo "=== 配置信息 ==="
+    if [[ -f "$CLIENT_DIR/client-info.txt" ]]; then
+        cat "$CLIENT_DIR/client-info.txt"
+    else
+        echo "配置文件不存在"
+    fi
+}
+
+show_qr() {
+    echo "=== 二维码 ==="
+    if [[ -f "$CLIENT_DIR/share-link.txt" ]]; then
+        qrencode -t ANSIUTF8 < "$CLIENT_DIR/share-link.txt"
+    else
+        echo "分享链接不存在"
+    fi
+}
+
+view_logs() {
+    case "$1" in
+        access|"")
+            echo "=== 访问日志 (最近50行) ==="
+            tail -50 "$LOG_FILE" 2>/dev/null || echo "日志文件不存在"
+            ;;
+        error)
+            echo "=== 错误日志 (最近50行) ==="
+            tail -50 "$ERROR_LOG" 2>/dev/null || echo "日志文件不存在"
+            ;;
+        live)
+            echo "=== 实时日志 (Ctrl+C 退出) ==="
+            tail -f "$LOG_FILE" "$ERROR_LOG"
+            ;;
+    esac
+}
+
+restart_service() {
+    echo "重启 Xray 服务..."
+    systemctl restart xray
+    if systemctl is-active --quiet xray; then
+        echo "✅ 服务重启成功"
+    else
+        echo "❌ 服务重启失败"
+        systemctl status xray --no-pager -l
+    fi
+}
+
+case "$1" in
+    status|st)
+        show_status
+        ;;
+    config|cfg)
+        show_config
+        ;;
+    qr)
+        show_qr
+        ;;
+    logs|log)
+        view_logs "$2"
+        ;;
+    restart|rs)
+        restart_service
+        ;;
+    *)
+        echo "VLESS Reality 管理工具"
+        echo ""
+        echo "用法: vless-mgr {comma
