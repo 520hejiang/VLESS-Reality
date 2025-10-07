@@ -17,13 +17,11 @@ blue() { echo -e "${BLUE}$1${PLAIN}"; }
 purple() { echo -e "${PURPLE}$1${PLAIN}"; }
 cyan() { echo -e "${CYAN}$1${PLAIN}"; }
 
-# 配置目录
 XRAY_DIR="/usr/local/etc/xray"
 CLIENT_DIR="/root/vless-clients"
 LOG_DIR="/var/log/xray"
 BACKUP_DIR="/root/vless-backups"
 
-# Reality 目标（速度优先）
 REALITY_TARGETS=(
     "www.apple.com:443"
     "www.microsoft.com:443"
@@ -33,7 +31,6 @@ REALITY_TARGETS=(
 
 [[ $EUID -ne 0 ]] && red "[!] 请使用 root 用户运行本脚本！" && exit 1
 
-# 系统检测
 detect_system() {
     if [[ -f /etc/os-release ]]; then
         source /etc/os-release
@@ -64,7 +61,6 @@ detect_system() {
     yellow "[*] 检测到系统: $SYSTEM $VERSION"
 }
 
-# 等待包管理器
 wait_for_package_manager() {
     yellow "[*] 检查包管理器..."
     
@@ -95,7 +91,6 @@ wait_for_package_manager() {
     fi
 }
 
-# 安装依赖
 install_dependencies() {
     yellow "[*] 安装依赖和安全工具..."
     
@@ -105,33 +100,35 @@ install_dependencies() {
     case $SYSTEM in
         "ubuntu"|"debian")
             $PKG_INSTALL curl wget unzip tar qrencode ufw jq bc \
-                         net-tools dnsutils openssl socat cron \
-                         fail2ban chrony
+                         net-tools dnsutils openssl socat cron
             
-            systemctl enable --now chronyd 2>/dev/null
+            $PKG_INSTALL fail2ban 2>/dev/null || yellow "[!] fail2ban 安装失败，跳过"
+            $PKG_INSTALL chrony 2>/dev/null || $PKG_INSTALL ntp 2>/dev/null
+            
+            systemctl enable --now chronyd 2>/dev/null || systemctl enable --now ntpd 2>/dev/null
             ;;
         "centos"|"rhel"|"fedora"|"rocky"|"almalinux")
             $PKG_INSTALL curl wget unzip tar qrencode firewalld jq bc \
-                         net-tools bind-utils openssl socat \
-                         fail2ban chrony
+                         net-tools bind-utils openssl socat chrony
             
-            systemctl enable --now chronyd
+            $PKG_INSTALL fail2ban 2>/dev/null || yellow "[!] fail2ban 安装失败，跳过"
+            
+            systemctl enable --now chronyd 2>/dev/null
             ;;
     esac
     
-    # 配置 fail2ban
-    setup_fail2ban
+    if command -v fail2ban-client &> /dev/null; then
+        setup_fail2ban
+    fi
 }
 
-# 配置 fail2ban
 setup_fail2ban() {
-    if command -v fail2ban-client &> /dev/null; then
-        yellow "[*] 配置 fail2ban..."
-        
-        systemctl enable --now fail2ban 2>/dev/null
-        
-        mkdir -p /etc/fail2ban/filter.d
-        cat > /etc/fail2ban/filter.d/xray.conf <<'EOF'
+    yellow "[*] 配置 fail2ban..."
+    
+    systemctl enable --now fail2ban 2>/dev/null
+    
+    mkdir -p /etc/fail2ban/filter.d
+    cat > /etc/fail2ban/filter.d/xray.conf <<'EOF'
 [Definition]
 failregex = .*rejected.* from <HOST>:.*
             .*invalid.* from <HOST>:.*
@@ -139,8 +136,8 @@ failregex = .*rejected.* from <HOST>:.*
 ignoreregex =
 EOF
 
-        mkdir -p /etc/fail2ban/jail.d
-        cat > /etc/fail2ban/jail.d/xray.conf <<EOF
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/xray.conf <<EOF
 [xray]
 enabled = true
 port = 80,443,8443
@@ -150,15 +147,11 @@ maxretry = 3
 bantime = 3600
 findtime = 600
 EOF
-        
-        systemctl restart fail2ban 2>/dev/null
-        green "[*] fail2ban 配置完成"
-    else
-        yellow "[!] fail2ban 未安装，跳过配置"
-    fi
+    
+    systemctl restart fail2ban 2>/dev/null
+    green "[*] fail2ban 配置完成"
 }
 
-# 获取服务器 IP
 get_server_ip() {
     yellow "[*] 获取服务器 IP..."
     
@@ -182,7 +175,6 @@ get_server_ip() {
     yellow "[*] 服务器 IP: $SERVER_IP"
 }
 
-# 智能选择最快的 Reality 目标
 select_reality_target() {
     yellow "[*] 测试 Reality 目标速度..."
     
@@ -233,7 +225,6 @@ select_reality_target() {
     green "[*] 选择最快目标: $REALITY_DEST (${min_time}ms)"
 }
 
-# 安装 Xray
 install_xray() {
     yellow "[*] 安装 Xray-core (最新版)..."
     
@@ -279,10 +270,9 @@ install_xray() {
         exit 1
     fi
     
-    rm -f /tmp/xray.zip /tmp/xray /tmp/geoip.dat /tmp/geosite.dat
+    rm -f /tmp/xray.zip /tmp/xray
 }
 
-# 生成密钥
 generate_keys() {
     yellow "[*] 生成密钥..."
     
@@ -290,39 +280,51 @@ generate_keys() {
     
     USER_UUID=$(cat /proc/sys/kernel/random/uuid)
     
-    # Reality 密钥对 - 修复版
-    KEY_PAIR=$(/usr/local/bin/xray x25519)
+    # 修复：使用临时文件捕获完整输出
+    yellow "[*] 正在生成 Reality 密钥对..."
     
-    # 等待确保输出完整
-    sleep 1
+    local temp_key_file="/tmp/xray_keys_$$.txt"
+    /usr/local/bin/xray x25519 > "$temp_key_file" 2>&1
     
-    # 更可靠的提取方式
-    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -i "Private key" | awk '{print $NF}' | tr -d '\r\n')
-    PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "Public key" | awk '{print $NF}' | tr -d '\r\n')
+    # 显示原始输出用于调试
+    yellow "[*] Xray 密钥生成输出："
+    cat "$temp_key_file"
     
-    # 验证密钥是否成功生成
-    if [[ -z "$PRIVATE_KEY" ]] || [[ -z "$PUBLIC_KEY" ]]; then
-        red "[!] 密钥生成失败，重试..."
-        
-        # 使用备用方法
-        cd /tmp || exit 1
-        /usr/local/bin/xray x25519 > key_output.txt 2>&1
-        
-        PRIVATE_KEY=$(grep -i "Private" key_output.txt | awk '{print $NF}' | tr -d '\r\n')
-        PUBLIC_KEY=$(grep -i "Public" key_output.txt | awk '{print $NF}' | tr -d '\r\n')
-        
-        rm -f key_output.txt
-        
-        # 再次验证
-        if [[ -z "$PRIVATE_KEY" ]] || [[ -z "$PUBLIC_KEY" ]]; then
-            red "[!] 无法生成密钥"
-            exit 1
-        fi
+    # 多种方式尝试提取密钥
+    PRIVATE_KEY=$(grep -i "private" "$temp_key_file" | grep -oE '[A-Za-z0-9_-]{43}' | head -1)
+    PUBLIC_KEY=$(grep -i "public" "$temp_key_file" | grep -oE '[A-Za-z0-9_-]{43}' | head -1)
+    
+    # 如果上面的方法失败，尝试其他模式
+    if [[ -z "$PRIVATE_KEY" ]]; then
+        PRIVATE_KEY=$(awk '/[Pp]rivate/{print $NF}' "$temp_key_file" | tr -d '\r\n' | head -1)
     fi
+    
+    if [[ -z "$PUBLIC_KEY" ]]; then
+        PUBLIC_KEY=$(awk '/[Pp]ublic/{print $NF}' "$temp_key_file" | tr -d '\r\n' | head -1)
+    fi
+    
+    # 清理临时文件
+    rm -f "$temp_key_file"
+    
+    # 验证密钥
+    if [[ -z "$PRIVATE_KEY" ]] || [[ ${#PRIVATE_KEY} -lt 40 ]]; then
+        red "[!] Private Key 生成失败或格式错误"
+        red "    Private Key: '$PRIVATE_KEY'"
+        exit 1
+    fi
+    
+    if [[ -z "$PUBLIC_KEY" ]] || [[ ${#PUBLIC_KEY} -lt 40 ]]; then
+        red "[!] Public Key 生成失败或格式错误"
+        red "    Public Key: '$PUBLIC_KEY'"
+        exit 1
+    fi
+    
+    green "[*] 密钥生成成功"
+    yellow "    Private Key: ${PRIVATE_KEY:0:20}...${PRIVATE_KEY: -10}"
+    yellow "    Public Key: ${PUBLIC_KEY:0:20}...${PUBLIC_KEY: -10}"
     
     SHORT_ID=$(openssl rand -hex 8)
     
-    # 端口选择
     if ss -tlnp | grep -q ":443 "; then
         LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
         while ss -tlnp | grep -q ":$LISTEN_PORT "; do
@@ -334,11 +336,6 @@ generate_keys() {
         green "[*] 使用最优端口: 443"
     fi
     
-    # 显示生成的密钥供验证
-    yellow "[*] Private Key: ${PRIVATE_KEY:0:20}..."
-    yellow "[*] Public Key: ${PUBLIC_KEY:0:20}..."
-    
-    # 保存密钥
     cat > "$XRAY_DIR/keys.txt" <<EOF
 Private Key: $PRIVATE_KEY
 Public Key: $PUBLIC_KEY
@@ -351,7 +348,6 @@ EOF
     chmod 600 "$XRAY_DIR/keys.txt"
 }
 
-# 配置 Xray 服务器（速度优化+安全加固）
 configure_xray_server() {
     yellow "[*] 配置 Xray 服务器（速度+安全优化）..."
     
@@ -457,7 +453,6 @@ EOF
 
     chmod 644 "$XRAY_DIR/config.json"
     
-    # 下载 Geo 数据
     yellow "[*] 下载 Geo 数据..."
     wget -q -O "$XRAY_DIR/geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" 2>/dev/null || \
     wget -q -O "$XRAY_DIR/geoip.dat" "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat"
@@ -468,15 +463,17 @@ EOF
     ln -sf "$XRAY_DIR/geoip.dat" /usr/local/bin/geoip.dat
     ln -sf "$XRAY_DIR/geosite.dat" /usr/local/bin/geosite.dat
     
+    yellow "[*] 验证配置..."
     if /usr/local/bin/xray -test -config="$XRAY_DIR/config.json"; then
         green "[*] 配置验证成功"
     else
         red "[!] 配置验证失败"
+        red "[!] 请检查配置文件: $XRAY_DIR/config.json"
+        red "[!] 密钥信息: $XRAY_DIR/keys.txt"
         exit 1
     fi
 }
 
-# 创建 systemd 服务
 create_systemd_service() {
     yellow "[*] 创建系统服务..."
     
@@ -496,13 +493,11 @@ RestartSec=3
 LimitNOFILE=1048576
 LimitNPROC=512
 
-# 性能优化
 CPUSchedulingPolicy=other
 CPUSchedulingPriority=0
 IOSchedulingClass=best-effort
 IOSchedulingPriority=4
 
-# 安全设置
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -534,7 +529,6 @@ EOF
     fi
 }
 
-# 配置防火墙
 configure_firewall() {
     yellow "[*] 配置防火墙..."
     
@@ -547,29 +541,24 @@ configure_firewall() {
         ufw --force enable
     fi
     
-    # iptables 规则
     iptables -I INPUT -p tcp --dport $LISTEN_PORT -j ACCEPT 2>/dev/null
     iptables -I INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     
-    # 防端口扫描
     iptables -N PORT_SCAN 2>/dev/null
     iptables -F PORT_SCAN 2>/dev/null
     iptables -A PORT_SCAN -p tcp --tcp-flags ALL NONE -j DROP 2>/dev/null
     iptables -A PORT_SCAN -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP 2>/dev/null
     
-    # 保存规则
     if command -v iptables-save &> /dev/null; then
         iptables-save > /etc/iptables/rules.v4 2>/dev/null
     fi
 }
 
-# 生成客户端配置
 generate_client_configs() {
     yellow "[*] 生成客户端配置..."
     
     mkdir -p "$CLIENT_DIR"
     
-    # 高性能客户端配置
     cat > "$CLIENT_DIR/client.json" <<EOF
 {
     "log": {
@@ -649,128 +638,56 @@ generate_client_configs() {
 }
 EOF
 
-    # 分享链接
     VLESS_LINK="vless://$USER_UUID@$SERVER_IP:$LISTEN_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_DEST&fp=chrome&pbk=$PUBLIC_KEY&sid=$SHORT_ID&type=tcp&headerType=none#VLESS-Reality-Ultimate"
     
     echo "$VLESS_LINK" > "$CLIENT_DIR/share-link.txt"
     
-    # 详细使用说明
     cat > "$CLIENT_DIR/README.txt" <<EOF
 VLESS Reality 终极完整版
 ========================
 
 服务器信息:
-- IP地址: $SERVER_IP
+- IP: $SERVER_IP
 - 端口: $LISTEN_PORT
 - UUID: $USER_UUID
-- Flow: xtls-rprx-vision (高速模式)
-- 传输: tcp
-- 安全: reality
+- Flow: xtls-rprx-vision
 - SNI: $REALITY_DEST
-- 指纹: chrome
 - 公钥: $PUBLIC_KEY
 - Short ID: $SHORT_ID
 
 分享链接:
 $VLESS_LINK
 
-速度优化特性:
-✅ XTLS Vision 流控 (速度提升2-3倍)
-✅ 自动选择最快 Reality 目标
-✅ TCP 零拷贝优化
-✅ 256MB 大缓冲区
-✅ BBR 拥塞控制
-✅ 系统参数极致优化
-
-安全防护特性:
-✅ fail2ban 防暴力破解
-✅ iptables 防端口扫描
-✅ systemd 安全沙箱
-✅ 日志监控
-✅ 自动备份功能
-
 管理命令:
-- vless-mgr status      # 查看完整状态
-- vless-mgr config      # 显示配置
-- vless-mgr qr          # 显示二维码
-- vless-mgr speed       # 性能信息
-- vless-mgr security    # 安全状态
+- vless-mgr status      # 完整状态
+- vless-mgr qr          # 二维码
+- vless-mgr security    # 安全信息
 - vless-mgr backup      # 备份配置
 - vless-mgr logs        # 查看日志
-- vless-mgr restart     # 重启服务
-
-客户端要求:
-- v2rayN 6.0+ (Windows)
-- v2rayNG 1.8.0+ (Android)
-- sing-box (推荐，全平台)
-- Shadowrocket (iOS)
-
-重要提示:
-1. 客户端必须支持 XTLS Vision
-2. 确保 flow 设置为 xtls-rprx-vision
-3. 推荐使用 direct 模式（不经系统代理）
-4. 定期备份配置: vless-mgr backup
-5. 查看安全日志: vless-mgr security
-
-配置文件:
-- 服务端: $XRAY_DIR/config.json
-- 客户端: $CLIENT_DIR/client.json
-- 密钥信息: $XRAY_DIR/keys.txt
-
-本地代理:
-- SOCKS5: 127.0.0.1:1080
-- HTTP: 127.0.0.1:1081
-
-性能对比:
-- 标准 VLESS: ~150-250 Mbps
-- XTLS Vision: ~300-500 Mbps
-- 提升: 2-3倍速度 🔥
 
 安装时间: $(date)
-系统: $SYSTEM $VERSION
 EOF
 
     chmod 600 "$CLIENT_DIR"/*
 }
 
-# 极致系统优化
 optimize_system() {
-    yellow "[*] 极致系统优化..."
+    yellow "[*] 系统优化..."
     
     cat >> /etc/sysctl.conf <<'EOF'
 
-# VLESS Reality 终极优化
+# VLESS Reality 优化
 net.core.rmem_max = 268435456
 net.core.wmem_max = 268435456
-net.core.rmem_default = 134217728
-net.core.wmem_default = 134217728
 net.core.netdev_max_backlog = 16384
-net.core.somaxconn = 8192
-
 net.ipv4.tcp_rmem = 8192 262144 268435456
 net.ipv4.tcp_wmem = 8192 262144 268435456
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = fq_codel
-
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_notsent_lowat = 16384
-
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 10
-
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_sack = 1
-
 net.ipv4.ip_forward = 1
 fs.file-max = 2097152
-
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.ip_local_port_range = 10000 65000
 EOF
 
     sysctl -p >/dev/null 2>&1
@@ -778,61 +695,28 @@ EOF
     cat >> /etc/security/limits.conf <<'EOF'
 * soft nofile 1048576
 * hard nofile 1048576
-* soft nproc unlimited
-* hard nproc unlimited
 root soft nofile 1048576
 root hard nofile 1048576
 EOF
-
-    mkdir -p /etc/systemd/system.conf.d
-    cat > /etc/systemd/system.conf.d/limits.conf <<'EOF'
-[Manager]
-DefaultLimitNOFILE=1048576
-DefaultLimitNPROC=unlimited
-EOF
-
-    systemctl daemon-reload
 }
 
-# 创建监控系统
 create_monitoring() {
     yellow "[*] 创建监控系统..."
     
     cat > /usr/local/bin/xray-monitor <<'EOF'
 #!/bin/bash
 
-LOG_DIR="/var/log/xray"
-ALERT_FILE="$LOG_DIR/alerts.log"
-
-# 检查服务健康
 if ! systemctl is-active --quiet xray; then
-    echo "$(date): Xray 服务异常，尝试重启" >> "$ALERT_FILE"
     systemctl restart xray
-    
-    sleep 3
-    if systemctl is-active --quiet xray; then
-        echo "$(date): Xray 服务重启成功" >> "$ALERT_FILE"
-    fi
+    logger "Xray auto-restarted"
 fi
-
-# 检查端口
-LISTEN_PORT=$(grep '"port":' /usr/local/etc/xray/config.json | head -1 | grep -o '[0-9]*')
-if [[ -n "$LISTEN_PORT" ]] && ! ss -tlnp | grep -q ":$LISTEN_PORT "; then
-    echo "$(date): 端口 $LISTEN_PORT 未监听" >> "$ALERT_FILE"
-    systemctl restart xray
-fi
-
-# 日志清理（保留7天）
-find "$LOG_DIR" -name "*.log" -mtime +7 -delete 2>/dev/null
 EOF
 
     chmod +x /usr/local/bin/xray-monitor
     
-    # 添加定时任务（每5分钟）
     (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/xray-monitor") | crontab -
 }
 
-# 创建完整管理工具
 create_management_tools() {
     yellow "[*] 创建管理工具..."
     
@@ -841,184 +725,35 @@ create_management_tools() {
 
 XRAY_DIR="/usr/local/etc/xray"
 CLIENT_DIR="/root/vless-clients"
-LOG_DIR="/var/log/xray"
-BACKUP_DIR="/root/vless-backups"
 
 show_status() {
-    echo "=== VLESS Reality 终极版状态 ==="
+    echo "=== VLESS Reality 状态 ==="
     systemctl status xray --no-pager -l
-    echo ""
-    echo "=== 系统资源 ==="
-    echo "CPU: $(top -bn1 | grep "Cpu(s)" | awk '{print $2}')%"
-    echo "内存: $(free -h | grep Mem | awk '{print $3"/"$2}')"
-    echo "连接数: $(ss -t 2>/dev/null | grep -c ESTAB)"
-    echo "运行时间: $(uptime -p)"
 }
 
 show_config() {
-    echo "=== 客户端配置 ==="
     [[ -f "$CLIENT_DIR/README.txt" ]] && cat "$CLIENT_DIR/README.txt" || echo "配置不存在"
 }
 
 show_qr() {
-    echo "=== 二维码 ==="
     [[ -f "$CLIENT_DIR/share-link.txt" ]] && qrencode -t ANSIUTF8 < "$CLIENT_DIR/share-link.txt" || echo "链接不存在"
 }
 
 show_security() {
     echo "=== 安全状态 ==="
-    echo "Xray 服务: $(systemctl is-active xray)"
+    echo "Xray: $(systemctl is-active xray)"
     echo "Fail2ban: $(systemctl is-active fail2ban 2>/dev/null || echo '未安装')"
-    echo ""
-    echo "=== 最近封禁的IP ==="
-    iptables -L INPUT -v -n 2>/dev/null | grep DROP | head -5 || echo "无"
-    echo ""
-    if command -v fail2ban-client &> /dev/null; then
-        echo "=== Fail2ban 状态 ==="
-        fail2ban-client status xray 2>/dev/null || echo "未配置 Xray 监控"
-    fi
-    echo ""
-    echo "=== 监控告警 ==="
-    [[ -f "$LOG_DIR/alerts.log" ]] && tail -10 "$LOG_DIR/alerts.log" || echo "无告警"
-}
-
-view_logs() {
-    case "$1" in
-        error)
-            echo "=== 错误日志 (最近50行) ==="
-            tail -50 "$LOG_DIR/error.log" 2>/dev/null || echo "日志不存在"
-            ;;
-        live)
-            echo "=== 实时日志 (Ctrl+C 退出) ==="
-            tail -f "$LOG_DIR/access.log" "$LOG_DIR/error.log"
-            ;;
-        *)
-            echo "=== 访问日志 (最近50行) ==="
-            tail -50 "$LOG_DIR/access.log" 2>/dev/null || echo "日志不存在"
-            ;;
-    esac
-}
-
-speed_test() {
-    echo "=== 性能信息 ==="
-    echo "TCP 拥塞控制: $(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | cut -d= -f2 | tr -d ' ')"
-    echo "接收缓冲区: $(sysctl net.core.rmem_max 2>/dev/null | awk '{print $3}' | numfmt --to=iec 2>/dev/null || echo '未知')"
-    echo "发送缓冲区: $(sysctl net.core.wmem_max 2>/dev/null | awk '{print $3}' | numfmt --to=iec 2>/dev/null || echo '未知')"
-    echo "文件描述符: $(ulimit -n)"
-    echo ""
-    echo "Xray 版本: $(/usr/local/bin/xray version 2>/dev/null | head -1 || echo '未知')"
-    echo "服务状态: $(systemctl is-active xray)"
-    echo ""
-    echo "=== Reality 目标 ==="
-    grep '"dest":' "$XRAY_DIR/config.json" | awk '{print $2}' | tr -d '",:'
-    echo ""
-    echo "建议客户端设置:"
-    echo "- 使用最新版客户端 (v2rayN 6.0+, v2rayNG 1.8.0+)"
-    echo "- 确保 flow 为 xtls-rprx-vision"
-    echo "- 推荐 sing-box 获得最佳性能"
-}
-
-backup_config() {
-    local backup_file="$BACKUP_DIR/vless-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-    mkdir -p "$BACKUP_DIR"
-    
-    tar -czf "$backup_file" "$XRAY_DIR" "$CLIENT_DIR" 2>/dev/null
-    
-    if [[ -f "$backup_file" ]]; then
-        echo "✅ 配置已备份到: $backup_file"
-        
-        # 只保留最近5个备份
-        ls -t "$BACKUP_DIR"/vless-backup-*.tar.gz | tail -n +6 | xargs rm -f 2>/dev/null
-        
-        echo ""
-        echo "现有备份:"
-        ls -lh "$BACKUP_DIR"/vless-backup-*.tar.gz 2>/dev/null | awk '{print $9, $5}'
-    else
-        echo "❌ 备份失败"
-    fi
-}
-
-list_backups() {
-    echo "=== 备份列表 ==="
-    if ls "$BACKUP_DIR"/vless-backup-*.tar.gz >/dev/null 2>&1; then
-        ls -lh "$BACKUP_DIR"/vless-backup-*.tar.gz | awk '{print $9, $5, $6, $7, $8}'
-    else
-        echo "暂无备份"
-    fi
-}
-
-restart_service() {
-    echo "重启 Xray 服务..."
-    systemctl restart xray
-    sleep 2
-    
-    if systemctl is-active --quiet xray; then
-        echo "✅ 服务重启成功"
-        echo ""
-        echo "验证连接:"
-        LISTEN_PORT=$(grep '"port":' "$XRAY_DIR/config.json" | head -1 | grep -o '[0-9]*')
-        if ss -tlnp 2>/dev/null | grep -q ":$LISTEN_PORT "; then
-            echo "✅ 端口 $LISTEN_PORT 正在监听"
-        else
-            echo "⚠️ 端口 $LISTEN_PORT 未监听"
-        fi
-    else
-        echo "❌ 服务重启失败"
-        echo ""
-        echo "错误日志:"
-        journalctl -u xray --no-pager -n 10
-    fi
 }
 
 case "$1" in
-    status|st)
-        show_status
-        ;;
-    config|cfg)
-        show_config
-        ;;
-    qr)
-        show_qr
-        ;;
-    security|sec)
-        show_security
-        ;;
-    logs|log)
-        view_logs "$2"
-        ;;
-    speed|test)
-        speed_test
-        ;;
-    backup|bk)
-        backup_config
-        ;;
-    list-backup|lb)
-        list_backups
-        ;;
-    restart|rs)
-        restart_service
-        ;;
+    status|st) show_status ;;
+    config|cfg) show_config ;;
+    qr) show_qr ;;
+    security|sec) show_security ;;
+    restart|rs) systemctl restart xray ;;
     *)
-        echo "VLESS Reality 终极版管理工具"
-        echo ""
-        echo "用法: vless-mgr {command} [options]"
-        echo ""
-        echo "命令:"
-        echo "  status / st        查看完整状态"
-        echo "  config / cfg       显示配置信息"
-        echo "  qr                 显示二维码"
-        echo "  security / sec     查看安全状态"
-        echo "  logs / log         查看日志 (error/live)"
-        echo "  speed / test       性能和优化信息"
-        echo "  backup / bk        备份配置"
-        echo "  list-backup / lb   列出所有备份"
-        echo "  restart / rs       重启服务"
-        echo ""
-        echo "示例:"
-        echo "  vless-mgr status     # 查看状态"
-        echo "  vless-mgr qr         # 显示二维码"
-        echo "  vless-mgr security   # 查看安全信息"
-        echo "  vless-mgr backup     # 备份配置"
+        echo "VLESS Reality 管理工具"
+        echo "用法: vless-mgr {status|config|qr|security|restart}"
         ;;
 esac
 EOF
@@ -1026,28 +761,9 @@ EOF
     chmod +x /usr/local/bin/vless-mgr
 }
 
-# 清理和文档生成
-cleanup_and_docs() {
-    yellow "[*] 清理和生成文档..."
-    
-    # 清理历史
-    history -c
-    echo "" > ~/.bash_history
-    
-    # 创建日志清理任务
-    cat > /etc/cron.daily/xray-cleanup <<'EOF'
-#!/bin/bash
-find /var/log/xray -name "*.log" -mtime +7 -delete 2>/dev/null
-find /root/vless-backups -name "*.tar.gz" -mtime +30 -delete 2>/dev/null
-EOF
-    chmod +x /etc/cron.daily/xray-cleanup
-}
-
-# 主流程
 main() {
     cyan "========================================"
     cyan "  VLESS Reality 终极完整版"
-    cyan "  (速度优化 + 安全防护 + 完整管理)"
     cyan "========================================"
     echo ""
     
@@ -1064,71 +780,30 @@ main() {
     optimize_system
     create_monitoring
     create_management_tools
-    cleanup_and_docs
     
     green "\n========================================"
-    green "  VLESS Reality 终极版安装成功! ✅"
+    green "  VLESS Reality 安装成功! ✅"
     green "========================================"
     echo ""
     cyan "服务器信息:"
-    echo "  IP地址: $SERVER_IP"
+    echo "  IP: $SERVER_IP"
     echo "  端口: $LISTEN_PORT"
     echo "  UUID: $USER_UUID"
-    echo "  Flow: xtls-rprx-vision (高速模式)"
-    echo "  Reality 目标: $REALITY_DEST"
-    echo ""
-    cyan "优化特性:"
-    echo "  ✅ XTLS Vision 流控 (速度提升2-3倍)"
-    echo "  ✅ 自动选择最快 Reality 目标"
-    echo "  ✅ 256MB 大缓冲区 + BBR 拥塞控制"
-    echo "  ✅ TCP 零拷贝优化"
-    echo ""
-    cyan "安全特性:"
-    echo "  ✅ fail2ban 防暴力破解"
-    echo "  ✅ iptables 防端口扫描"
-    echo "  ✅ systemd 安全沙箱"
-    echo "  ✅ 自动监控 (每5分钟)"
-    echo "  ✅ 日志自动清理"
-    echo ""
-    cyan "管理功能:"
-    echo "  ✅ 完整状态查看"
-    echo "  ✅ 安全状态监控"
-    echo "  ✅ 性能信息查询"
-    echo "  ✅ 配置自动备份"
-    echo "  ✅ 日志实时查看"
-    echo ""
-    cyan "配置文件:"
-    echo "  服务端: $XRAY_DIR/config.json"
-    echo "  客户端: $CLIENT_DIR/client.json"
-    echo "  文档: $CLIENT_DIR/README.txt"
+    echo "  Flow: xtls-rprx-vision"
     echo ""
     cyan "连接链接:"
     cat "$CLIENT_DIR/share-link.txt"
     echo ""
     cyan "管理命令:"
-    echo "  vless-mgr status      # 完整状态"
-    echo "  vless-mgr qr          # 二维码"
-    echo "  vless-mgr security    # 安全信息"
-    echo "  vless-mgr speed       # 性能信息"
-    echo "  vless-mgr backup      # 备份配置"
-    echo "  vless-mgr logs live   # 实时日志"
+    echo "  vless-mgr status    # 查看状态"
+    echo "  vless-mgr qr        # 显示二维码"
+    echo "  vless-mgr config    # 显示配置"
     echo ""
     yellow "二维码:"
     qrencode -t ANSIUTF8 < "$CLIENT_DIR/share-link.txt"
     echo ""
     green "安装完成! 🚀"
-    echo ""
-    purple "性能对比:"
-    echo "  标准 VLESS: 150-250 Mbps ⭐⭐⭐"
-    echo "  终极版: 300-500 Mbps ⭐⭐⭐⭐⭐"
-    echo "  速度提升: 2-3倍 🔥"
-    echo ""
-    yellow "重要提示:"
-    echo "  - 客户端需要 v2rayN 6.0+ 或 v2rayNG 1.8.0+"
-    echo "  - 确保 flow 设置为 xtls-rprx-vision"
-    echo "  - 推荐使用 sing-box 获得最佳性能"
-    echo "  - 定期备份: vless-mgr backup"
-    echo "  - 查看详细说明: cat $CLIENT_DIR/README.txt"
+    echo "详细信息: cat $CLIENT_DIR/README.txt"
     echo "========================================"
 }
 
