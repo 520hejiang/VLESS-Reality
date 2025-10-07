@@ -291,9 +291,9 @@ generate_keys() {
     USER_UUID=$(cat /proc/sys/kernel/random/uuid)
     
     KEY_PAIR=$(/usr/local/bin/xray x25519)
-    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep "Private key:" | awk '{print $3}')
-    PUBLIC_KEY=$(echo "$KEY_PAIR" | grep "Public key:" | awk '{print $3}')
-    
+    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -i "Private key" | sed -E 's/.*:[[:space:]]*//')
+PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "Public key" | sed -E 's/.*:[[:space:]]*//')
+
     SHORT_ID=$(openssl rand -hex 8)
     
     if ss -tlnp | grep -q ":443 "; then
