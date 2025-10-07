@@ -282,20 +282,33 @@ install_xray() {
     rm -f /tmp/xray.zip /tmp/xray /tmp/geoip.dat /tmp/geosite.dat
 }
 
-# 生成密钥
 generate_keys() {
     yellow "[*] 生成密钥..."
-    
+
     mkdir -p "$XRAY_DIR" "$CLIENT_DIR" "$LOG_DIR" "$BACKUP_DIR"
-    
+
     USER_UUID=$(cat /proc/sys/kernel/random/uuid)
-    
+
+    # 新旧版本通用密钥生成
     KEY_PAIR=$(/usr/local/bin/xray x25519)
-PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -i "PrivateKey" | sed -E 's/.*:[[:space:]]*//')
-PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "Hash32" | sed -E 's/.*:[[:space:]]*//')
+
+    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -Ei "PrivateKey|Private key" | sed -E 's/.*:[[:space:]]*//')
+    PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -Ei "Hash32|Public key" | sed -E 's/.*:[[:space:]]*//')
 
     SHORT_ID=$(openssl rand -hex 8)
-    
+
+    # 确保有默认的目标
+    REALITY_DEST=${REALITY_DEST:-www.microsoft.com}
+    REALITY_PORT=${REALITY_PORT:-443}
+
+    # 检查生成结果
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        red "[!] 密钥生成失败，Xray 输出格式可能改变。"
+        echo "$KEY_PAIR" > "$XRAY_DIR/debug_key_output.txt"
+        exit 1
+    fi
+
+    # 检查端口
     if ss -tlnp | grep -q ":443 "; then
         LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
         while ss -tlnp | grep -q ":$LISTEN_PORT "; do
@@ -306,7 +319,7 @@ PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "Hash32" | sed -E 's/.*:[[:space:]]*//')
         LISTEN_PORT=443
         green "[*] 使用最优端口: 443"
     fi
-    
+
     cat > "$XRAY_DIR/keys.txt" <<EOF
 Private Key: $PRIVATE_KEY
 Public Key: $PUBLIC_KEY
@@ -316,6 +329,7 @@ Listen Port: $LISTEN_PORT
 Reality Target: $REALITY_DEST:$REALITY_PORT
 Install Date: $(date)
 EOF
+
     chmod 600 "$XRAY_DIR/keys.txt"
 }
 
