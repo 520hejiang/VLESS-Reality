@@ -291,8 +291,8 @@ generate_keys() {
     USER_UUID=$(cat /proc/sys/kernel/random/uuid)
     
     KEY_PAIR=$(/usr/local/bin/xray x25519)
-    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -i "Private key" | sed -E 's/.*:[[:space:]]*//')
-PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "Public key" | sed -E 's/.*:[[:space:]]*//')
+PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -i "PrivateKey" | sed -E 's/.*:[[:space:]]*//')
+PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "Hash32" | sed -E 's/.*:[[:space:]]*//')
 
     SHORT_ID=$(openssl rand -hex 8)
     
