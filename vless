@@ -274,78 +274,107 @@ install_xray() {
 }
 
 generate_keys() {
-    yellow "[*] 生成密钥..."
-    
+    yellow "[*] 生成 Reality 密钥..."
+
+    # ==== 目录准备 ====
     mkdir -p "$XRAY_DIR" "$CLIENT_DIR" "$LOG_DIR" "$BACKUP_DIR"
-    
+
     USER_UUID=$(cat /proc/sys/kernel/random/uuid)
-    
-    # 修复：使用临时文件捕获完整输出
+
+    # ==== 自动检测 xray 路径 ====
+    XRAY_BIN=""
+    for p in /usr/local/bin/xray /usr/bin/xray /root/xray /opt/xray/xray; do
+        if [[ -x "$p" ]]; then
+            XRAY_BIN="$p"
+            break
+        fi
+    done
+
+    if [[ -z "$XRAY_BIN" ]]; then
+        red "[!] 未检测到 xray 可执行文件，请确认已正确安装。"
+        red "    可尝试执行命令:  which xray"
+        exit 1
+    fi
+
+    yellow "[*] 使用 Xray 可执行文件: $XRAY_BIN"
     yellow "[*] 正在生成 Reality 密钥对..."
-    
+
     local temp_key_file="/tmp/xray_keys_$$.txt"
-    /usr/local/bin/xray x25519 > "$temp_key_file" 2>&1
-    
-    # 显示原始输出用于调试
+
+    if ! "$XRAY_BIN" x25519 > "$temp_key_file" 2>&1; then
+        red "[!] Xray 执行失败，可能路径错误或 xray 未安装。"
+        cat "$temp_key_file"
+        rm -f "$temp_key_file"
+        exit 1
+    fi
+
     yellow "[*] Xray 密钥生成输出："
     cat "$temp_key_file"
-    
-    # 多种方式尝试提取密钥
-    PRIVATE_KEY=$(grep -i "private" "$temp_key_file" | grep -oE '[A-Za-z0-9_-]{43}' | head -1)
-    PUBLIC_KEY=$(grep -i "public" "$temp_key_file" | grep -oE '[A-Za-z0-9_-]{43}' | head -1)
-    
-    # 如果上面的方法失败，尝试其他模式
-    if [[ -z "$PRIVATE_KEY" ]]; then
-        PRIVATE_KEY=$(awk '/[Pp]rivate/{print $NF}' "$temp_key_file" | tr -d '\r\n' | head -1)
+
+    # ==== 提取密钥 ====
+    # 兼容多种输出格式，例如：
+    # Private key: xxx
+    # PrivateKey: xxx
+    # private: xxx
+    # 等等
+
+    PRIVATE_KEY=$(awk '/[Pp]rivate/{print $NF}' "$temp_key_file" | tr -d '\r\n' | head -1)
+    PUBLIC_KEY=$(awk '/[Pp]ublic/{print $NF}' "$temp_key_file" | tr -d '\r\n' | head -1)
+
+    # 如果提取失败，尝试另一种方式
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        PRIVATE_KEY=$(grep -ioE '[A-Za-z0-9_-]{40,}' "$temp_key_file" | head -1)
+        PUBLIC_KEY=$(grep -ioE '[A-Za-z0-9_-]{40,}' "$temp_key_file" | tail -1)
     fi
-    
-    if [[ -z "$PUBLIC_KEY" ]]; then
-        PUBLIC_KEY=$(awk '/[Pp]ublic/{print $NF}' "$temp_key_file" | tr -d '\r\n' | head -1)
-    fi
-    
-    # 清理临时文件
+
     rm -f "$temp_key_file"
-    
-    # 验证密钥
+
+    # ==== 验证密钥 ====
     if [[ -z "$PRIVATE_KEY" ]] || [[ ${#PRIVATE_KEY} -lt 40 ]]; then
         red "[!] Private Key 生成失败或格式错误"
         red "    Private Key: '$PRIVATE_KEY'"
         exit 1
     fi
-    
+
     if [[ -z "$PUBLIC_KEY" ]] || [[ ${#PUBLIC_KEY} -lt 40 ]]; then
         red "[!] Public Key 生成失败或格式错误"
         red "    Public Key: '$PUBLIC_KEY'"
         exit 1
     fi
-    
+
     green "[*] 密钥生成成功"
     yellow "    Private Key: ${PRIVATE_KEY:0:20}...${PRIVATE_KEY: -10}"
     yellow "    Public Key: ${PUBLIC_KEY:0:20}...${PUBLIC_KEY: -10}"
-    
+
+    # ==== 生成 Short ID ====
     SHORT_ID=$(openssl rand -hex 8)
-    
+
+    # ==== 自动分配端口 ====
     if ss -tlnp | grep -q ":443 "; then
         LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
         while ss -tlnp | grep -q ":$LISTEN_PORT "; do
             LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
         done
-        yellow "[!] 443端口被占用，使用 $LISTEN_PORT"
+        yellow "[!] 443 端口被占用，自动使用端口 $LISTEN_PORT"
     else
         LISTEN_PORT=443
         green "[*] 使用最优端口: 443"
     fi
-    
+
+    # ==== 保存结果 ====
     cat > "$XRAY_DIR/keys.txt" <<EOF
 Private Key: $PRIVATE_KEY
 Public Key: $PUBLIC_KEY
 UUID: $USER_UUID
 Short ID: $SHORT_ID
 Listen Port: $LISTEN_PORT
-Reality Target: $REALITY_DEST:$REALITY_PORT
+Reality Target: ${REALITY_DEST:-www.cloudflare.com}:${REALITY_PORT:-443}
 Install Date: $(date)
 EOF
+
     chmod 600 "$XRAY_DIR/keys.txt"
+
+    green "[*] Reality 密钥与配置信息已保存至: $XRAY_DIR/keys.txt"
 }
 
 configure_xray_server() {
