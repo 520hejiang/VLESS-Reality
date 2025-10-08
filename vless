@@ -99,14 +99,18 @@ install_dependencies() {
 
     eval "$PKG_UPDATE"
 
-   # 安装 netcat 工具（兼容多系统）
-if command -v apt >/dev/null 2>&1; then
-    apt install -y netcat-traditional || apt install -y netcat-openbsd
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y nmap-ncat
-elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y nmap-ncat
-fi
+   # 基础工具
+    eval "$PKG_INSTALL curl wget unzip tar qrencode nginx certbot \
+                 python3-certbot-nginx ufw fail2ban jq bc \
+                 net-tools dnsutils openssl socat cron nmap"
+
+    # 安装 netcat（兼容多系统）
+    if [[ "$SYSTEM" == "ubuntu" || "$SYSTEM" == "debian" ]]; then
+        apt install -y netcat-traditional || apt install -y netcat-openbsd
+    elif [[ "$SYSTEM" == "centos" || "$SYSTEM" == "rocky" || "$SYSTEM" == "almalinux" ]]; then
+        yum install -y nmap-ncat
+    fi
+
     # 时间同步 (Reality 对时间敏感)
     if command -v chronyd >/dev/null 2>&1 || systemctl list-unit-files | grep -q chrony; then
         eval "$PKG_INSTALL chrony" || true
