@@ -129,29 +129,46 @@ install_dependencies() {
 get_server_ip() {
     yellow "[*] 获取服务器公网 IP..."
 
-    # 多源检测
+    # 多源检测（按优先级排序）
     local ip_sources=(
         "https://api.ipify.org"
         "https://icanhazip.com"
+        "https://ipinfo.io/ip"
         "https://ifconfig.me/ip"
+        "https://checkip.amazonaws.com"
         "https://api.ip.sb/ip"
     )
 
     for source in "${ip_sources[@]}"; do
-        SERVER_IP=$(timeout 5 curl -s4 "$source" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
-        [[ -n "$SERVER_IP" ]] && break
+        yellow "[*] 尝试从 $source 获取..."
+        SERVER_IP=$(curl -s4 --connect-timeout 3 --max-time 5 "$source" 2>/dev/null | grep -oE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' | head -1)
+        if [[ -n "$SERVER_IP" ]]; then
+            green "[✓] 成功获取 IP"
+            break
+        fi
     done
 
-    # IPv6 检测
-    SERVER_IPV6=$(timeout 5 curl -s6 "https://api6.ipify.org" 2>/dev/null | grep -E '^[0-9a-fA-F:]+$' | head -1)
-
+    # 如果还是失败，尝试从网卡获取
     if [[ -z "$SERVER_IP" ]]; then
-        red "[!] 无法获取服务器 IP，请检查网络"
-        exit 1
+        yellow "[*] API 获取失败，尝试从网卡读取..."
+        SERVER_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
     fi
 
-    green "[✓] IPv4: $SERVER_IP"
-    [[ -n "$SERVER_IPV6" ]] && green "[✓] IPv6: $SERVER_IPV6"
+    # IPv6 检测（非关键，失败不影响）
+    SERVER_IPV6=$(curl -s6 --connect-timeout 2 --max-time 3 "https://api6.ipify.org" 2>/dev/null | grep -oE '^([0-9a-fA-F]{0,4}:){7}[0-9a-fA-F]{0,4}$' | head -1 || true)
+
+    if [[ -z "$SERVER_IP" ]]; then
+        red "[!] 无法获取服务器 IP"
+        red "[!] 请手动输入服务器 IP 地址"
+        read -rp "请输入 IP: " SERVER_IP
+        if [[ -z "$SERVER_IP" ]]; then
+            red "[!] IP 不能为空"
+            exit 1
+        fi
+    fi
+
+    green "[✓] 服务器 IPv4: $SERVER_IP"
+    [[ -n "$SERVER_IPV6" ]] && green "[✓] 服务器 IPv6: $SERVER_IPV6"
 }
 
 # 选择伪装域名
