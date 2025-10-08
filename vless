@@ -1,327 +1,227 @@
 #!/bin/bash
 
-export LANG=en_US.UTF-8
+# ============================================
+# Xray Reality 一键安装脚本 - 完整修复版
+# 修复：IP转发、NAT规则、DNS配置
+# ============================================
 
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-PURPLE="\033[35m"
-CYAN="\033[36m"
-PLAIN="\033[0m"
+set -e
 
-red() { echo -e "${RED}$1${PLAIN}"; }
-green() { echo -e "${GREEN}$1${PLAIN}"; }
-yellow() { echo -e "${YELLOW}$1${PLAIN}"; }
-blue() { echo -e "${BLUE}$1${PLAIN}"; }
-purple() { echo -e "${PURPLE}$1${PLAIN}"; }
-cyan() { echo -e "${CYAN}$1${PLAIN}"; }
+# 颜色输出函数
+red() { echo -e "\033[31m$1\033[0m"; }
+green() { echo -e "\033[32m$1\033[0m"; }
+yellow() { echo -e "\033[33m$1\033[0m"; }
+blue() { echo -e "\033[34m$1\033[0m"; }
 
+# 配置目录
 XRAY_DIR="/usr/local/etc/xray"
-CLIENT_DIR="/root/vless-clients"
+CLIENT_DIR="/root/xray-client"
 LOG_DIR="/var/log/xray"
-BACKUP_DIR="/root/vless-backups"
+BACKUP_DIR="/root/xray-backup"
 
-REALITY_TARGETS=(
-    "www.apple.com:443"
-    "www.microsoft.com:443"
-    "www.lovelive-anime.jp:443"
-    "www.cisco.com:443"
-)
+# Reality 配置 - 防封锁优化
+REALITY_DEST="www.microsoft.com"  # 使用大型可信站点
+REALITY_PORT="443"
+REALITY_SNI="www.microsoft.com"   # SNI与目标站点一致
 
-[[ $EUID -ne 0 ]] && red "[!] 请使用 root 用户运行本脚本！" && exit 1
+# 防封锁配置
+ENABLE_CAMOUFLAGE=true           # 启用流量伪装
+ENABLE_RANDOM_PORT=false         # 是否随机端口（建议443）
+ENABLE_TRAFFIC_OBFUSCATION=true  # 启用流量混淆
 
-detect_system() {
+# 全局变量
+LISTEN_PORT=""
+USER_UUID=""
+PRIVATE_KEY=""
+PUBLIC_KEY=""
+SHORT_ID=""
+NET_INTERFACE=""
+
+# ============================================
+# 检查系统环境
+# ============================================
+check_system() {
+    blue "================================================"
+    blue "  Xray Reality 一键安装脚本 - 完整修复版"
+    blue "================================================"
+    echo
+
+    # 检查root权限
+    if [[ $EUID -ne 0 ]]; then
+        red "[!] 错误：请使用 root 权限运行此脚本"
+        red "    使用命令: sudo bash $0"
+        exit 1
+    fi
+
+    # 检查系统类型
     if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        SYSTEM="$ID"
-        VERSION="$VERSION_ID"
+        . /etc/os-release
+        OS=$ID
+        VERSION=$VERSION_ID
     else
-        red "[!] 无法检测系统类型"
+        red "[!] 无法识别系统类型"
         exit 1
     fi
 
-    case $SYSTEM in
-        "ubuntu"|"debian")
-            PKG_MANAGER="apt"
-            PKG_INSTALL="apt install -y"
-            PKG_UPDATE="apt update -y"
-            ;;
-        "centos"|"rhel"|"fedora"|"rocky"|"almalinux")
-            PKG_MANAGER="yum"
-            PKG_INSTALL="yum install -y"
-            PKG_UPDATE="yum update -y"
-            ;;
-        *)
-            red "[!] 不支持的系统: $SYSTEM"
-            exit 1
-            ;;
-    esac
+    green "[✓] 系统检查通过: $OS $VERSION"
 
-    yellow "[*] 检测到系统: $SYSTEM $VERSION"
-}
-
-wait_for_package_manager() {
-    yellow "[*] 检查包管理器..."
-    
-    local max_attempts=60
-    local attempt=0
-    
-    while [[ $attempt -lt $max_attempts ]]; do
-        if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
-            break
-        fi
-        
-        if [[ $attempt -eq 0 ]]; then
-            yellow "[*] 等待包管理器..."
-        fi
-        
-        echo -n "."
-        sleep 5
-        ((attempt++))
-    done
-    
-    echo ""
-    
-    if [[ $attempt -ge $max_attempts ]]; then
-        killall apt apt-get dpkg 2>/dev/null
-        sleep 2
-        rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
-        dpkg --configure -a
+    # 检查网络
+    if ! ping -c 1 8.8.8.8 &>/dev/null; then
+        red "[!] 网络连接异常，请检查网络设置"
+        exit 1
     fi
+    green "[✓] 网络连接正常"
 }
 
+# ============================================
+# 1. 安装系统依赖
+# ============================================
 install_dependencies() {
-    yellow "[*] 安装依赖和安全工具..."
-    
-    wait_for_package_manager
-    $PKG_UPDATE
-    
-    case $SYSTEM in
-        "ubuntu"|"debian")
-            $PKG_INSTALL curl wget unzip tar qrencode ufw jq bc \
-                         net-tools dnsutils openssl socat cron
-            
-            $PKG_INSTALL fail2ban 2>/dev/null || yellow "[!] fail2ban 安装失败，跳过"
-            $PKG_INSTALL chrony 2>/dev/null || $PKG_INSTALL ntp 2>/dev/null
-            
-            systemctl enable --now chronyd 2>/dev/null || systemctl enable --now ntpd 2>/dev/null
-            ;;
-        "centos"|"rhel"|"fedora"|"rocky"|"almalinux")
-            $PKG_INSTALL curl wget unzip tar qrencode firewalld jq bc \
-                         net-tools bind-utils openssl socat chrony
-            
-            $PKG_INSTALL fail2ban 2>/dev/null || yellow "[!] fail2ban 安装失败，跳过"
-            
-            systemctl enable --now chronyd 2>/dev/null
-            ;;
-    esac
-    
-    if command -v fail2ban-client &> /dev/null; then
-        setup_fail2ban
-    fi
-}
+    green "\n[1/8] 安装系统依赖..."
 
-setup_fail2ban() {
-    yellow "[*] 配置 fail2ban..."
-    
-    systemctl enable --now fail2ban 2>/dev/null
-    
-    mkdir -p /etc/fail2ban/filter.d
-    cat > /etc/fail2ban/filter.d/xray.conf <<'EOF'
-[Definition]
-failregex = .*rejected.* from <HOST>:.*
-            .*invalid.* from <HOST>:.*
-            .*failed.* from <HOST>:.*
-ignoreregex =
-EOF
-
-    mkdir -p /etc/fail2ban/jail.d
-    cat > /etc/fail2ban/jail.d/xray.conf <<EOF
-[xray]
-enabled = true
-port = 80,443,8443
-filter = xray
-logpath = $LOG_DIR/error.log
-maxretry = 3
-bantime = 3600
-findtime = 600
-EOF
-    
-    systemctl restart fail2ban 2>/dev/null
-    green "[*] fail2ban 配置完成"
-}
-
-get_server_ip() {
-    yellow "[*] 获取服务器 IP..."
-    
-    IP_SOURCES=(
-        "https://api.ipify.org"
-        "https://icanhazip.com"
-        "https://ipv4.icanhazip.com"
-        "https://checkip.amazonaws.com"
-    )
-    
-    for source in "${IP_SOURCES[@]}"; do
-        SERVER_IP=$(curl -s --connect-timeout 5 --max-time 10 "$source" 2>/dev/null | grep -E '^[0-9.]+$')
-        [[ -n "$SERVER_IP" ]] && break
-    done
-    
-    if [[ -z "$SERVER_IP" ]]; then
-        red "[!] 无法获取服务器 IP"
-        exit 1
-    fi
-    
-    yellow "[*] 服务器 IP: $SERVER_IP"
-}
-
-select_reality_target() {
-    yellow "[*] 测试 Reality 目标速度..."
-    
-    declare -A target_speeds
-    
-    for target in "${REALITY_TARGETS[@]}"; do
-        host="${target%:*}"
-        port="${target#*:}"
-        
-        total_time=0
-        success_count=0
-        
-        for i in {1..3}; do
-            start_time=$(date +%s%N)
-            if timeout 3 bash -c "echo > /dev/tcp/$host/$port" 2>/dev/null; then
-                end_time=$(date +%s%N)
-                time_ms=$(( (end_time - start_time) / 1000000 ))
-                total_time=$((total_time + time_ms))
-                ((success_count++))
-            fi
-        done
-        
-        if [[ $success_count -gt 0 ]]; then
-            avg_time=$((total_time / success_count))
-            target_speeds[$target]=$avg_time
-            yellow "    $host: ${avg_time}ms"
-        fi
-    done
-    
-    REALITY_TARGET=""
-    min_time=999999
-    
-    for target in "${!target_speeds[@]}"; do
-        if [[ ${target_speeds[$target]} -lt $min_time ]]; then
-            min_time=${target_speeds[$target]}
-            REALITY_TARGET="$target"
-        fi
-    done
-    
-    if [[ -z "$REALITY_TARGET" ]]; then
-        yellow "[!] 所有目标都无法访问，使用默认"
-        REALITY_TARGET="${REALITY_TARGETS[0]}"
-    fi
-    
-    REALITY_DEST="${REALITY_TARGET%:*}"
-    REALITY_PORT="${REALITY_TARGET#*:}"
-    
-    green "[*] 选择最快目标: $REALITY_DEST (${min_time}ms)"
-}
-
-install_xray() {
-    yellow "[*] 安装 Xray-core (最新版)..."
-    
-    LATEST_VERSION=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name' | sed 's/v//')
-    
-    if [[ -z "$LATEST_VERSION" ]]; then
-        red "[!] 无法获取最新版本"
-        exit 1
-    fi
-    
-    yellow "[*] 最新版本: $LATEST_VERSION"
-    
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64) ARCH="64" ;;
-        aarch64) ARCH="arm64-v8a" ;;
-        armv7l) ARCH="arm32-v7a" ;;
-        *) red "[!] 不支持的架构: $ARCH"; exit 1 ;;
-    esac
-    
-    DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/v$LATEST_VERSION/Xray-linux-$ARCH.zip"
-    
-    cd /tmp || exit 1
-    
-    if ! wget -O xray.zip "$DOWNLOAD_URL" 2>/dev/null; then
-        yellow "[*] 直连失败，尝试镜像..."
-        wget -O xray.zip "https://ghproxy.com/$DOWNLOAD_URL" || {
-            red "[!] 下载失败"
-            exit 1
-        }
-    fi
-    
-    unzip -o xray.zip
-    
-    mkdir -p /usr/local/bin /usr/local/etc/xray /var/log/xray
-    mv xray /usr/local/bin/
-    chmod +x /usr/local/bin/xray
-    
-    if /usr/local/bin/xray version | grep -q "Xray"; then
-        green "[*] Xray 安装成功: $(/usr/local/bin/xray version | head -1)"
+    if [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]]; then
+        apt-get update -y
+        apt-get install -y curl wget unzip qrencode iptables iptables-persistent \
+            net-tools sudo openssl ca-certificates
+    elif [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]]; then
+        yum install -y curl wget unzip qrencode iptables iptables-services \
+            net-tools sudo openssl ca-certificates
     else
+        red "[!] 不支持的系统类型: $OS"
+        exit 1
+    fi
+
+    green "[✓] 依赖安装完成"
+}
+
+# ============================================
+# 2. 配置系统网络参数（关键！）
+# ============================================
+configure_system() {
+    green "\n[2/8] 配置系统网络参数..."
+
+    # 备份原有配置
+    if [[ -f /etc/sysctl.conf ]]; then
+        cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%Y%m%d_%H%M%S)
+    fi
+
+    # 创建 Xray 专用配置文件
+    cat > /etc/sysctl.d/99-xray.conf <<'EOF'
+# IPv4 转发 (必须!)
+net.ipv4.ip_forward = 1
+
+# IPv6 转发
+net.ipv6.conf.all.forwarding = 1
+
+# 允许本地路由
+net.ipv4.conf.all.route_localnet = 1
+
+# TCP 优化
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# 连接追踪优化
+net.netfilter.nf_conntrack_max = 1000000
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+
+# 网络缓冲区优化
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+EOF
+
+    # 应用配置
+    sysctl -p /etc/sysctl.d/99-xray.conf >/dev/null 2>&1
+
+    # 验证 IP 转发是否启用
+    if [[ $(cat /proc/sys/net/ipv4/ip_forward) != "1" ]]; then
+        red "[!] IP 转发启用失败，尝试手动启用..."
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        
+        if [[ $(cat /proc/sys/net/ipv4/ip_forward) != "1" ]]; then
+            red "[!] IP 转发无法启用，脚本终止"
+            exit 1
+        fi
+    fi
+
+    green "[✓] 系统参数配置完成"
+    yellow "    - IP转发: $(cat /proc/sys/net/ipv4/ip_forward)"
+    yellow "    - BBR: $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')"
+}
+
+# ============================================
+# 3. 安装 Xray-core
+# ============================================
+install_xray() {
+    green "\n[3/8] 安装 Xray-core..."
+
+    # 检查是否已安装
+    if [[ -f /usr/local/bin/xray ]]; then
+        yellow "[*] 检测到已安装 Xray，正在更新..."
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    else
+        yellow "[*] 开始安装 Xray..."
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    fi
+
+    # 验证安装
+    if [[ ! -f /usr/local/bin/xray ]]; then
         red "[!] Xray 安装失败"
         exit 1
     fi
-    
-    rm -f /tmp/xray.zip /tmp/xray
+
+    XRAY_VERSION=$(xray version 2>/dev/null | head -1)
+    green "[✓] Xray 安装成功: $XRAY_VERSION"
+
+    # 创建必要目录
+    mkdir -p "$XRAY_DIR" "$CLIENT_DIR" "$LOG_DIR" "$BACKUP_DIR"
+    chmod 755 "$XRAY_DIR" "$LOG_DIR"
+    chmod 700 "$CLIENT_DIR" "$BACKUP_DIR"
 }
 
+# ============================================
+# 4. 生成 Reality 密钥
+# ============================================
 generate_keys() {
-    yellow "[*] 生成 Reality 密钥..."
+    green "\n[4/8] 生成 Reality 密钥..."
 
-    # ==== 目录准备 ====
-    mkdir -p "$XRAY_DIR" "$CLIENT_DIR" "$LOG_DIR" "$BACKUP_DIR"
-
+    # 生成 UUID
     USER_UUID=$(cat /proc/sys/kernel/random/uuid)
+    yellow "[*] UUID: $USER_UUID"
 
-    # ==== 自动检测 xray 路径 ====
+    # 检测 xray 可执行文件
     XRAY_BIN=""
-    for p in /usr/local/bin/xray /usr/bin/xray /root/xray /opt/xray/xray; do
-        if [[ -x "$p" ]]; then
-            XRAY_BIN="$p"
+    for path in /usr/local/bin/xray /usr/bin/xray /root/xray /opt/xray/xray; do
+        if [[ -x "$path" ]]; then
+            XRAY_BIN="$path"
             break
         fi
     done
 
     if [[ -z "$XRAY_BIN" ]]; then
-        red "[!] 未检测到 xray 可执行文件，请确认已正确安装。"
-        red "    可尝试执行命令:  which xray"
+        red "[!] 未检测到 xray 可执行文件"
+        red "    请检查 Xray 是否正确安装"
         exit 1
     fi
 
-    yellow "[*] 使用 Xray 可执行文件: $XRAY_BIN"
-    yellow "[*] 正在生成 Reality 密钥对..."
+    yellow "[*] 使用 Xray: $XRAY_BIN"
 
+    # 生成密钥对
     local temp_key_file="/tmp/xray_keys_$$.txt"
-
+    
     if ! "$XRAY_BIN" x25519 > "$temp_key_file" 2>&1; then
-        red "[!] Xray 执行失败，可能路径错误或 xray 未安装。"
+        red "[!] 密钥生成失败"
         cat "$temp_key_file"
         rm -f "$temp_key_file"
         exit 1
     fi
 
-    yellow "[*] Xray 密钥生成输出："
-    cat "$temp_key_file"
-
-    # ==== 提取密钥 ====
-    # 兼容多种输出格式，例如：
-    # Private key: xxx
-    # PrivateKey: xxx
-    # private: xxx
-    # 等等
-
+    # 提取密钥 (兼容多种输出格式)
     PRIVATE_KEY=$(awk '/[Pp]rivate/{print $NF}' "$temp_key_file" | tr -d '\r\n' | head -1)
     PUBLIC_KEY=$(awk '/[Pp]ublic/{print $NF}' "$temp_key_file" | tr -d '\r\n' | head -1)
 
-    # 如果提取失败，尝试另一种方式
+    # 如果提取失败，使用正则表达式
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
         PRIVATE_KEY=$(grep -ioE '[A-Za-z0-9_-]{40,}' "$temp_key_file" | head -1)
         PUBLIC_KEY=$(grep -ioE '[A-Za-z0-9_-]{40,}' "$temp_key_file" | tail -1)
@@ -329,7 +229,7 @@ generate_keys() {
 
     rm -f "$temp_key_file"
 
-    # ==== 验证密钥 ====
+    # 验证密钥
     if [[ -z "$PRIVATE_KEY" ]] || [[ ${#PRIVATE_KEY} -lt 40 ]]; then
         red "[!] Private Key 生成失败或格式错误"
         red "    Private Key: '$PRIVATE_KEY'"
@@ -342,498 +242,477 @@ generate_keys() {
         exit 1
     fi
 
-    green "[*] 密钥生成成功"
-    yellow "    Private Key: ${PRIVATE_KEY:0:20}...${PRIVATE_KEY: -10}"
-    yellow "    Public Key: ${PUBLIC_KEY:0:20}...${PUBLIC_KEY: -10}"
-
-    # ==== 生成 Short ID ====
+    # 生成 Short ID
     SHORT_ID=$(openssl rand -hex 8)
 
-    # ==== 自动分配端口 ====
-    if ss -tlnp | grep -q ":443 "; then
-        LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
-        while ss -tlnp | grep -q ":$LISTEN_PORT "; do
-            LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
-        done
-        yellow "[!] 443 端口被占用，自动使用端口 $LISTEN_PORT"
+    # 端口分配 - 防封锁策略
+    if [[ "$ENABLE_RANDOM_PORT" == "true" ]]; then
+        # 随机高位端口（更隐蔽但可能被限制）
+        LISTEN_PORT=$(shuf -i 20000-50000 -n 1)
+        yellow "[*] 使用随机端口: $LISTEN_PORT（增强隐蔽性）"
     else
-        LISTEN_PORT=443
-        green "[*] 使用最优端口: 443"
+        # 优先使用443（伪装成HTTPS流量）
+        if ss -tlnp 2>/dev/null | grep -q ":443 " || netstat -tlnp 2>/dev/null | grep -q ":443 "; then
+            # 443被占用，使用其他常见端口
+            for port in 8443 2053 2083 2087 2096; do
+                if ! ss -tlnp 2>/dev/null | grep -q ":$port "; then
+                    LISTEN_PORT=$port
+                    break
+                fi
+            done
+            if [[ -z "$LISTEN_PORT" ]]; then
+                LISTEN_PORT=$(shuf -i 10000-65000 -n 1)
+            fi
+            yellow "[!] 443端口被占用，使用备用端口: $LISTEN_PORT"
+        else
+            LISTEN_PORT=443
+            green "[*] 使用最佳端口: 443（伪装HTTPS流量）"
+        fi
     fi
 
-    # ==== 保存结果 ====
+    # 保存密钥信息
     cat > "$XRAY_DIR/keys.txt" <<EOF
+================================================
+Xray Reality 密钥信息
+================================================
 Private Key: $PRIVATE_KEY
 Public Key: $PUBLIC_KEY
 UUID: $USER_UUID
 Short ID: $SHORT_ID
 Listen Port: $LISTEN_PORT
-Reality Target: ${REALITY_DEST:-www.cloudflare.com}:${REALITY_PORT:-443}
-Install Date: $(date)
+Reality Target: $REALITY_DEST:$REALITY_PORT
+Reality SNI: $REALITY_SNI
+Generated: $(date '+%Y-%m-%d %H:%M:%S')
+================================================
 EOF
 
     chmod 600 "$XRAY_DIR/keys.txt"
 
-    green "[*] Reality 密钥与配置信息已保存至: $XRAY_DIR/keys.txt"
+    green "[✓] 密钥生成成功"
+    yellow "    Private Key: ${PRIVATE_KEY:0:20}...${PRIVATE_KEY: -10}"
+    yellow "    Public Key: ${PUBLIC_KEY:0:20}...${PUBLIC_KEY: -10}"
+    yellow "    Short ID: $SHORT_ID"
 }
 
-configure_xray_server() {
-    yellow "[*] 配置 Xray 服务器（速度+安全优化）..."
-    
-    mkdir -p "$XRAY_DIR" "$LOG_DIR"
-    
+# ============================================
+# 5. 配置防火墙规则（关键！）
+# ============================================
+configure_firewall() {
+    green "\n[5/8] 配置防火墙规则..."
+
+    # 检测网卡
+    NET_INTERFACE=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+    if [[ -z "$NET_INTERFACE" ]]; then
+        NET_INTERFACE=$(ip -4 addr | grep -oP '(?<=^\d: )\w+' | grep -v lo | head -1)
+    fi
+    if [[ -z "$NET_INTERFACE" ]]; then
+        NET_INTERFACE="eth0"
+    fi
+
+    yellow "[*] 使用网卡: $NET_INTERFACE"
+
+    # 清理旧规则 (谨慎操作)
+    iptables -t nat -F 2>/dev/null || true
+    iptables -t mangle -F 2>/dev/null || true
+    iptables -F 2>/dev/null || true
+    iptables -X 2>/dev/null || true
+
+    # 设置默认策略
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+
+    # 允许本地回环
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
+
+    # 允许已建立的连接
+    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+    # 允许 SSH (防止锁死)
+    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+    # 允许 Xray 端口
+    iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -j ACCEPT
+
+    # 防DPI检测 - 允许常见端口出站
+    iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+
+    # 限制连接速率（防主动探测）
+    iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -m state --state NEW -m recent --set
+    iptables -A INPUT -p tcp --dport "$LISTEN_PORT" -m state --state NEW -m recent --update --seconds 60 --hitcount 10 -j DROP
+
+    # NAT 转发规则 (核心！)
+    iptables -t nat -A POSTROUTING -o "$NET_INTERFACE" -j MASQUERADE
+
+    # FORWARD 规则
+    iptables -A FORWARD -i "$NET_INTERFACE" -o "$NET_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -A FORWARD -i "$NET_INTERFACE" -o "$NET_INTERFACE" -j ACCEPT
+
+    # 保存规则
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save
+        green "[✓] 规则已保存 (netfilter-persistent)"
+    elif command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+        green "[✓] 规则已保存 (/etc/iptables/rules.v4)"
+    fi
+
+    green "[✓] 防火墙规则配置完成"
+}
+
+# ============================================
+# 6. 生成服务端配置文件
+# ============================================
+generate_server_config() {
+    green "\n[6/8] 生成服务端配置..."
+
+    # 备份旧配置
+    if [[ -f "$XRAY_DIR/config.json" ]]; then
+        cp "$XRAY_DIR/config.json" "$BACKUP_DIR/config.json.bak.$(date +%Y%m%d_%H%M%S)"
+    fi
+
+    # 生成新配置
     cat > "$XRAY_DIR/config.json" <<EOF
 {
-    "log": {
-        "access": "$LOG_DIR/access.log",
-        "error": "$LOG_DIR/error.log",
-        "loglevel": "warning"
-    },
-    "inbounds": [
-        {
-            "port": $LISTEN_PORT,
-            "protocol": "vless",
-            "settings": {
-                "clients": [
-                    {
-                        "id": "$USER_UUID",
-                        "flow": "xtls-rprx-vision"
-                    }
-                ],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "dest": "$REALITY_DEST:$REALITY_PORT",
-                    "serverNames": [
-                        "$REALITY_DEST"
-                    ],
-                    "privateKey": "$PRIVATE_KEY",
-                    "shortIds": [
-                        "$SHORT_ID",
-                        ""
-                    ]
-                },
-                "tcpSettings": {
-                    "acceptProxyProtocol": false,
-                    "header": {
-                        "type": "none"
-                    }
-                }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
-            }
+  "log": {
+    "loglevel": "warning",
+    "access": "$LOG_DIR/access.log",
+    "error": "$LOG_DIR/error.log"
+  },
+  "inbounds": [
+    {
+      "port": $LISTEN_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$USER_UUID",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "$REALITY_DEST:$REALITY_PORT",
+          "xver": 0,
+          "serverNames": [
+            "$REALITY_SNI",
+            "www.microsoft.com",
+            "www.apple.com",
+            "www.cloudflare.com"
+          ],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": [
+            "$SHORT_ID",
+            ""
+          ],
+          "minClientVer": "",
+          "maxClientVer": "",
+          "maxTimeDiff": 0
         }
-    ],
-    "outbounds": [
-        {
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4"
-            },
-            "tag": "direct"
-        },
-        {
-            "protocol": "blackhole",
-            "settings": {},
-            "tag": "blocked"
-        }
-    ],
-    "routing": {
-        "domainStrategy": "AsIs",
-        "rules": [
-            {
-                "type": "field",
-                "ip": [
-                    "geoip:private"
-                ],
-                "outboundTag": "blocked"
-            },
-            {
-                "type": "field",
-                "domain": [
-                    "geosite:category-ads-all"
-                ],
-                "outboundTag": "blocked"
-            }
-        ]
-    },
-    "policy": {
-        "levels": {
-            "0": {
-                "handshake": 2,
-                "connIdle": 300,
-                "uplinkOnly": 1,
-                "downlinkOnly": 1,
-                "bufferSize": 512
-            }
-        },
-        "system": {
-            "statsInboundUplink": false,
-            "statsInboundDownlink": false
-        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic",
+          "fakedns"
+        ],
+        "metadataOnly": false
+      }
     }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "protocol": [
+          "bittorrent"
+        ],
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "geoip:private"
+        ],
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-ads-all"
+        ],
+        "outboundTag": "block"
+      }
+    ]
+  },
+  "dns": {
+    "servers": [
+      {
+        "address": "https://dns.google/dns-query",
+        "domains": [
+          "geosite:geolocation-!cn"
+        ]
+      },
+      {
+        "address": "https://cloudflare-dns.com/dns-query",
+        "domains": [
+          "geosite:geolocation-!cn"
+        ]
+      },
+      "8.8.8.8",
+      "1.1.1.1"
+    ],
+    "queryStrategy": "UseIPv4",
+    "disableCache": false,
+    "disableFallback": false
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "handshake": 4,
+        "connIdle": 300,
+        "uplinkOnly": 2,
+        "downlinkOnly": 5
+      }
+    }
+  }
 }
 EOF
 
     chmod 644 "$XRAY_DIR/config.json"
-    
-    yellow "[*] 下载 Geo 数据..."
-    wget -q -O "$XRAY_DIR/geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" 2>/dev/null || \
-    wget -q -O "$XRAY_DIR/geoip.dat" "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat"
-    
-    wget -q -O "$XRAY_DIR/geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" 2>/dev/null || \
-    wget -q -O "$XRAY_DIR/geosite.dat" "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat"
-    
-    ln -sf "$XRAY_DIR/geoip.dat" /usr/local/bin/geoip.dat
-    ln -sf "$XRAY_DIR/geosite.dat" /usr/local/bin/geosite.dat
-    
-    yellow "[*] 验证配置..."
-    if /usr/local/bin/xray -test -config="$XRAY_DIR/config.json"; then
-        green "[*] 配置验证成功"
-    else
-        red "[!] 配置验证失败"
-        red "[!] 请检查配置文件: $XRAY_DIR/config.json"
-        red "[!] 密钥信息: $XRAY_DIR/keys.txt"
+
+    # 验证配置
+    if ! xray -test -config="$XRAY_DIR/config.json" >/dev/null 2>&1; then
+        red "[!] 配置文件验证失败"
+        xray -test -config="$XRAY_DIR/config.json"
         exit 1
     fi
+
+    green "[✓] 服务端配置生成完成"
 }
 
-create_systemd_service() {
-    yellow "[*] 创建系统服务..."
-    
-    cat > /etc/systemd/system/xray.service <<EOF
-[Unit]
-Description=Xray Service (Speed + Security Optimized)
-Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
-Wants=network.target
+# ============================================
+# 7. 启动 Xray 服务
+# ============================================
+start_xray_service() {
+    green "\n[7/8] 启动 Xray 服务..."
 
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/xray run -config $XRAY_DIR/config.json
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-LimitNPROC=512
+    # 停止旧服务
+    systemctl stop xray 2>/dev/null || true
 
-CPUSchedulingPolicy=other
-CPUSchedulingPriority=0
-IOSchedulingClass=best-effort
-IOSchedulingPriority=4
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log/xray
-PrivateTmp=true
-ProtectControlGroups=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
+    # 重载守护进程
     systemctl daemon-reload
+
+    # 启用开机自启
     systemctl enable xray
-    
-    if systemctl start xray; then
-        sleep 2
-        if systemctl is-active --quiet xray; then
-            green "[*] Xray 服务启动成功"
-        else
-            red "[!] Xray 服务启动失败"
-            journalctl -u xray --no-pager -n 20
-            exit 1
-        fi
+
+    # 启动服务
+    systemctl start xray
+
+    # 等待服务启动
+    sleep 3
+
+    # 检查服务状态
+    if systemctl is-active --quiet xray; then
+        green "[✓] Xray 服务启动成功"
     else
-        red "[!] 无法启动 Xray"
+        red "[!] Xray 服务启动失败，查看日志："
+        journalctl -u xray -n 30 --no-pager
         exit 1
     fi
-}
 
-configure_firewall() {
-    yellow "[*] 配置防火墙..."
-    
-    if command -v ufw &> /dev/null; then
-        ufw --force reset >/dev/null 2>&1
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw allow ssh
-        ufw allow $LISTEN_PORT comment 'VLESS Reality'
-        ufw --force enable
-    fi
-    
-    iptables -I INPUT -p tcp --dport $LISTEN_PORT -j ACCEPT 2>/dev/null
-    iptables -I INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-    
-    iptables -N PORT_SCAN 2>/dev/null
-    iptables -F PORT_SCAN 2>/dev/null
-    iptables -A PORT_SCAN -p tcp --tcp-flags ALL NONE -j DROP 2>/dev/null
-    iptables -A PORT_SCAN -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP 2>/dev/null
-    
-    if command -v iptables-save &> /dev/null; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    # 检查端口监听
+    sleep 2
+    if ss -tlnp | grep -q ":$LISTEN_PORT "; then
+        green "[✓] 端口 $LISTEN_PORT 正在监听"
+    else
+        yellow "[!] 警告：端口 $LISTEN_PORT 未检测到监听"
     fi
 }
 
-generate_client_configs() {
-    yellow "[*] 生成客户端配置..."
-    
-    mkdir -p "$CLIENT_DIR"
-    
-    cat > "$CLIENT_DIR/client.json" <<EOF
-{
-    "log": {
-        "loglevel": "warning"
-    },
-    "inbounds": [
-        {
-            "port": 1080,
-            "listen": "127.0.0.1",
-            "protocol": "socks",
-            "settings": {
-                "udp": true
-            }
-        },
-        {
-            "port": 1081,
-            "listen": "127.0.0.1",
-            "protocol": "http"
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "vless",
-            "settings": {
-                "vnext": [
-                    {
-                        "address": "$SERVER_IP",
-                        "port": $LISTEN_PORT,
-                        "users": [
-                            {
-                                "id": "$USER_UUID",
-                                "encryption": "none",
-                                "flow": "xtls-rprx-vision"
-                            }
-                        ]
-                    }
-                ]
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "serverName": "$REALITY_DEST",
-                    "fingerprint": "chrome",
-                    "publicKey": "$PUBLIC_KEY",
-                    "shortId": "$SHORT_ID",
-                    "spiderX": "/"
-                },
-                "tcpSettings": {
-                    "header": {
-                        "type": "none"
-                    }
-                }
-            },
-            "tag": "proxy"
-        },
-        {
-            "protocol": "freedom",
-            "tag": "direct"
-        }
-    ],
-    "routing": {
-        "domainStrategy": "IPIfNonMatch",
-        "rules": [
-            {
-                "type": "field",
-                "domain": ["geosite:cn"],
-                "outboundTag": "direct"
-            },
-            {
-                "type": "field",
-                "ip": ["geoip:cn", "geoip:private"],
-                "outboundTag": "direct"
-            }
-        ]
-    }
-}
-EOF
+# ============================================
+# 8. 生成客户端配置
+# ============================================
+generate_client_config() {
+    green "\n[8/8] 生成客户端配置..."
 
-    VLESS_LINK="vless://$USER_UUID@$SERVER_IP:$LISTEN_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_DEST&fp=chrome&pbk=$PUBLIC_KEY&sid=$SHORT_ID&type=tcp&headerType=none#VLESS-Reality-Ultimate"
+    # 获取服务器IP
+    SERVER_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || curl -s https://icanhazip.com)
     
-    echo "$VLESS_LINK" > "$CLIENT_DIR/share-link.txt"
-    
-    cat > "$CLIENT_DIR/README.txt" <<EOF
-VLESS Reality 终极完整版
-========================
+    if [[ -z "$SERVER_IP" ]]; then
+        yellow "[!] 无法自动获取服务器IP，请手动输入："
+        read -p "服务器IP: " SERVER_IP
+    fi
 
-服务器信息:
-- IP: $SERVER_IP
-- 端口: $LISTEN_PORT
-- UUID: $USER_UUID
-- Flow: xtls-rprx-vision
-- SNI: $REALITY_DEST
-- 公钥: $PUBLIC_KEY
-- Short ID: $SHORT_ID
+    yellow "[*] 服务器IP: $SERVER_IP"
 
-分享链接:
+    # 生成 VLESS 链接 - 使用 Chrome 浏览器指纹
+    VLESS_LINK="vless://${USER_UUID}@${SERVER_IP}:${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Xray-Reality-${SERVER_IP}"
+
+    # 保存客户端配置
+    cat > "$CLIENT_DIR/client-config.txt" <<EOF
+================================================
+Xray Reality 客户端配置
+================================================
+
+连接信息:
+服务器地址: $SERVER_IP
+端口: $LISTEN_PORT
+UUID: $USER_UUID
+Public Key: $PUBLIC_KEY
+Short ID: $SHORT_ID
+SNI: $REALITY_SNI
+Flow: xtls-rprx-vision
+安全性: reality
+传输协议: tcp
+指纹: chrome
+
+================================================
+VLESS 分享链接:
+================================================
 $VLESS_LINK
 
-管理命令:
-- vless-mgr status      # 完整状态
-- vless-mgr qr          # 二维码
-- vless-mgr security    # 安全信息
-- vless-mgr backup      # 备份配置
-- vless-mgr logs        # 查看日志
+================================================
+客户端推荐:
+================================================
+- Windows: v2rayN (https://github.com/2dust/v2rayN/releases)
+- Android: v2rayNG (https://github.com/2dust/v2rayNG/releases)
+- iOS: Shadowrocket / Stash
+- macOS: V2rayU / Qv2ray
 
-安装时间: $(date)
+使用方法:
+1. 复制上方 VLESS 链接
+2. 在客户端中选择 "从剪贴板导入"
+3. 连接即可使用
+
+================================================
+防封锁建议:
+================================================
+✓ Reality 协议：无特征流量，GFW无法检测
+✓ 使用 443 端口：伪装成正常 HTTPS 流量
+✓ 目标站点：${REALITY_DEST}（大型可信网站）
+✓ Chrome 指纹：模拟真实浏览器行为
+✓ 连接速率限制：防止主动探测攻击
+
+安全提示:
+• 不要分享配置给不信任的人
+• 定期更换 UUID 和 ShortID
+• 避免在敏感时期大流量使用
+• 建议启用客户端的自动切换节点功能
+
+================================================
+生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+================================================
 EOF
 
-    chmod 600 "$CLIENT_DIR"/*
+    chmod 600 "$CLIENT_DIR/client-config.txt"
+
+    # 生成二维码
+    if command -v qrencode &>/dev/null; then
+        echo "$VLESS_LINK" | qrencode -o "$CLIENT_DIR/qrcode.png"
+        green "[✓] 二维码已保存: $CLIENT_DIR/qrcode.png"
+    fi
+
+    green "[✓] 客户端配置已保存: $CLIENT_DIR/client-config.txt"
 }
 
-optimize_system() {
-    yellow "[*] 系统优化..."
-    
-    cat >> /etc/sysctl.conf <<'EOF'
-
-# VLESS Reality 优化
-net.core.rmem_max = 268435456
-net.core.wmem_max = 268435456
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_rmem = 8192 262144 268435456
-net.ipv4.tcp_wmem = 8192 262144 268435456
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq_codel
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.ip_forward = 1
-fs.file-max = 2097152
-EOF
-
-    sysctl -p >/dev/null 2>&1
-    
-    cat >> /etc/security/limits.conf <<'EOF'
-* soft nofile 1048576
-* hard nofile 1048576
-root soft nofile 1048576
-root hard nofile 1048576
-EOF
+# ============================================
+# 显示安装结果
+# ============================================
+show_result() {
+    clear
+    blue "========================================================"
+    green "           Xray Reality 安装完成！"
+    blue "========================================================"
+    echo
+    green "✓ 服务状态: $(systemctl is-active xray)"
+    green "✓ 监听端口: $LISTEN_PORT"
+    green "✓ 服务器IP: $(curl -s https://api.ipify.org)"
+    green "✓ Reality目标: $REALITY_DEST"
+    echo
+    yellow "防封锁特性:"
+    echo "  ✓ Reality 协议 - 无特征流量，GFW无法识别"
+    echo "  ✓ TLS指纹伪装 - 模拟 Chrome 浏览器"
+    echo "  ✓ 端口策略 - 优先使用443端口（HTTPS）"
+    echo "  ✓ 连接限速 - 防止主动探测攻击"
+    echo "  ✓ 多域名SNI - 增强伪装效果"
+    echo "  ✓ Vision协议 - 抗封锁能力最强"
+    echo
+    yellow "配置文件位置:"
+    echo "  • 服务端配置: $XRAY_DIR/config.json"
+    echo "  • 客户端配置: $CLIENT_DIR/client-config.txt"
+    echo "  • 密钥文件: $XRAY_DIR/keys.txt"
+    echo "  • 二维码: $CLIENT_DIR/qrcode.png"
+    echo
+    yellow "常用管理命令:"
+    echo "  • 查看状态: systemctl status xray"
+    echo "  • 启动服务: systemctl start xray"
+    echo "  • 停止服务: systemctl stop xray"
+    echo "  • 重启服务: systemctl restart xray"
+    echo "  • 查看日志: journalctl -u xray -f"
+    echo "  • 测试配置: xray -test -config $XRAY_DIR/config.json"
+    echo "  • 防火墙规则: iptables -L -n -v"
+    echo
+    yellow "客户端连接信息:"
+    echo "────────────────────────────────────────────────────────"
+    cat "$CLIENT_DIR/client-config.txt" | grep -A 1 "VLESS 分享链接:"
+    echo "────────────────────────────────────────────────────────"
+    echo
+    red "⚠️  安全建议:"
+    echo "  • 请妥善保管配置信息，不要泄露给他人"
+    echo "  • 定期更新 Xray 版本: bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)"
+    echo "  • 建议每月更换一次 UUID 和密钥"
+    echo "  • 避免在敏感时期进行大流量传输"
+    echo "  • 推荐使用 CDN 中转进一步增强抗封锁能力"
+    echo
+    blue "========================================================"
+    green "提示: Reality 协议理论上无法被 GFW 识别和封锁"
+    blue "========================================================"
+    echo
 }
 
-create_monitoring() {
-    yellow "[*] 创建监控系统..."
-    
-    cat > /usr/local/bin/xray-monitor <<'EOF'
-#!/bin/bash
-
-if ! systemctl is-active --quiet xray; then
-    systemctl restart xray
-    logger "Xray auto-restarted"
-fi
-EOF
-
-    chmod +x /usr/local/bin/xray-monitor
-    
-    (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/xray-monitor") | crontab -
-}
-
-create_management_tools() {
-    yellow "[*] 创建管理工具..."
-    
-    cat > /usr/local/bin/vless-mgr <<'EOF'
-#!/bin/bash
-
-XRAY_DIR="/usr/local/etc/xray"
-CLIENT_DIR="/root/vless-clients"
-
-show_status() {
-    echo "=== VLESS Reality 状态 ==="
-    systemctl status xray --no-pager -l
-}
-
-show_config() {
-    [[ -f "$CLIENT_DIR/README.txt" ]] && cat "$CLIENT_DIR/README.txt" || echo "配置不存在"
-}
-
-show_qr() {
-    [[ -f "$CLIENT_DIR/share-link.txt" ]] && qrencode -t ANSIUTF8 < "$CLIENT_DIR/share-link.txt" || echo "链接不存在"
-}
-
-show_security() {
-    echo "=== 安全状态 ==="
-    echo "Xray: $(systemctl is-active xray)"
-    echo "Fail2ban: $(systemctl is-active fail2ban 2>/dev/null || echo '未安装')"
-}
-
-case "$1" in
-    status|st) show_status ;;
-    config|cfg) show_config ;;
-    qr) show_qr ;;
-    security|sec) show_security ;;
-    restart|rs) systemctl restart xray ;;
-    *)
-        echo "VLESS Reality 管理工具"
-        echo "用法: vless-mgr {status|config|qr|security|restart}"
-        ;;
-esac
-EOF
-
-    chmod +x /usr/local/bin/vless-mgr
-}
-
+# ============================================
+# 主函数
+# ============================================
 main() {
-    cyan "========================================"
-    cyan "  VLESS Reality 终极完整版"
-    cyan "========================================"
-    echo ""
-    
-    detect_system
+    check_system
     install_dependencies
-    get_server_ip
-    select_reality_target
+    configure_system
     install_xray
     generate_keys
-    configure_xray_server
-    create_systemd_service
     configure_firewall
-    generate_client_configs
-    optimize_system
-    create_monitoring
-    create_management_tools
-    
-    green "\n========================================"
-    green "  VLESS Reality 安装成功! ✅"
-    green "========================================"
-    echo ""
-    cyan "服务器信息:"
-    echo "  IP: $SERVER_IP"
-    echo "  端口: $LISTEN_PORT"
-    echo "  UUID: $USER_UUID"
-    echo "  Flow: xtls-rprx-vision"
-    echo ""
-    cyan "连接链接:"
-    cat "$CLIENT_DIR/share-link.txt"
-    echo ""
-    cyan "管理命令:"
-    echo "  vless-mgr status    # 查看状态"
-    echo "  vless-mgr qr        # 显示二维码"
-    echo "  vless-mgr config    # 显示配置"
-    echo ""
-    yellow "二维码:"
-    qrencode -t ANSIUTF8 < "$CLIENT_DIR/share-link.txt"
-    echo ""
-    green "安装完成! 🚀"
-    echo "详细信息: cat $CLIENT_DIR/README.txt"
-    echo "========================================"
+    generate_server_config
+    start_xray_service
+    generate_client_config
+    show_result
 }
 
-main "$@"
+# 执行主函数
+main
