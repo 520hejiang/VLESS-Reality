@@ -249,31 +249,56 @@ install_xray() {
 
 # 生成密钥
 generate_keys() {
-    cyan "===================================="
-    cyan "  生成密钥"
-    cyan "===================================="
-    
-    USER_UUID=$(cat /proc/sys/kernel/random/uuid)
-    green "[✓] UUID: $USER_UUID"
-    
-    local keypair=$(/usr/local/bin/xray x25519 2>/dev/null)
-    PRIVATE_KEY=$(echo "$keypair" | grep "Private key" | awk '{print $3}')
-    PUBLIC_KEY=$(echo "$keypair" | grep "Public key" | awk '{print $3}')
-    
-    [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]] && red "错误: 密钥生成失败" && exit 1
-    
-    green "[✓] 密钥生成成功"
-    
+    yellow "[*] 生成密钥和配置..."
+
+    # UUID
+    if command -v uuidgen &>/dev/null; then
+        USER_UUID=$(uuidgen | tr 'A-Z' 'a-z')
+    else
+        USER_UUID=$(cat /proc/sys/kernel/random/uuid)
+    fi
+
+    # Reality 密钥对
+    local key_output
+    key_output=$(/usr/local/bin/xray x25519 2>/dev/null)
+    PRIVATE_KEY=$(echo "$key_output" | grep -i "Private key" | awk '{print $3}')
+    PUBLIC_KEY=$(echo "$key_output" | grep -i "Public key" | awk '{print $3}')
+
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        red "[!] 无法生成 Reality 密钥"
+        exit 1
+    fi
+
+    # 生成 Short ID (8位或16位)
     SHORT_ID=$(openssl rand -hex 8)
-    green "[✓] Short ID: $SHORT_ID"
-    
+
+    # 选择端口
     if ss -tlnp 2>/dev/null | grep -q ":443 "; then
-        LISTEN_PORT=$((RANDOM % 40000 + 20000))
-        yellow "[!] 443 被占用，使用端口: $LISTEN_PORT"
+        LISTEN_PORT=$(shuf -i 10000-60000 -n 1)
+        while ss -tlnp 2>/dev/null | grep -q ":$LISTEN_PORT "; do
+            LISTEN_PORT=$(shuf -i 10000-60000 -n 1)
+        done
+        yellow "[*] 端口 443 被占用，使用端口: $LISTEN_PORT"
     else
         LISTEN_PORT=443
-        green "[✓] 端口: 443"
     fi
+
+    # 保存密钥
+    mkdir -p "$XRAY_DIR"
+    cat > "$XRAY_DIR/keys.txt" <<EOF
+UUID: $USER_UUID
+Private Key: $PRIVATE_KEY
+Public Key: $PUBLIC_KEY
+Short ID: $SHORT_ID
+Listen Port: $LISTEN_PORT
+Reality Target: $REALITY_DEST:$REALITY_PORT
+Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+EOF
+    chmod 600 "$XRAY_DIR/keys.txt"
+
+    green "[✓] 密钥生成完成"
+    green "[✓] UUID: $USER_UUID"
+    green "[✓] 端口: $LISTEN_PORT"
 }
 
 # 配置 Xray
