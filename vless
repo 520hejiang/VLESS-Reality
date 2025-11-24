@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VLESS Reality 终极速度优化版
-# 针对中国网络环境深度优化
+# VLESS Reality 终极优化版 - 完全修复版
+# 已修复所有已知问题
 
 set -e
 export LANG=C.UTF-8
@@ -63,16 +63,16 @@ SERVER_IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null)
 [[ -z "$SERVER_IP" ]] && error "无法获取 IP"
 info "服务器 IP: $SERVER_IP"
 
-# Reality 目标选择（速度优先）
+# Reality 目标选择
 info "选择伪装目标..."
 echo ""
 echo "【推荐】速度和稳定性优先："
 echo ""
-echo "1) www.microsoft.com (推荐，全球CDN)"
-echo "2) www.apple.com (速度快)"
-echo "3) www.amazon.com (带宽大)"
-echo "4) www.samsung.com (亚太优化)"
-echo "5) download.jetbrains.com (技术站，速度极快)"
+echo "1) www.microsoft.com (推荐)"
+echo "2) www.apple.com"
+echo "3) www.amazon.com"
+echo "4) www.samsung.com"
+echo "5) download.jetbrains.com"
 echo ""
 read -p "选择 [1-5, 默认1]: " choice
 
@@ -87,8 +87,8 @@ esac
 
 info "目标: $REALITY_DEST"
 
-# 下载最新版 Xray
-info "下载 Xray-core 最新版..."
+# 下载 Xray
+info "下载 Xray-core..."
 ARCH=$(uname -m)
 case $ARCH in
     x86_64) XRAY_ARCH="64" ;;
@@ -96,11 +96,7 @@ case $ARCH in
     *) error "不支持的架构: $ARCH" ;;
 esac
 
-# 获取最新版本
-LATEST_VERSION=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep '"tag_name"' | cut -d '"' -f 4 | sed 's/v//')
-VERSION=${LATEST_VERSION:-"1.8.10"}
-info "Xray 版本: $VERSION"
-
+VERSION="1.8.10"
 URL="https://github.com/XTLS/Xray-core/releases/download/v${VERSION}/Xray-linux-${XRAY_ARCH}.zip"
 
 cd /tmp
@@ -121,13 +117,47 @@ rm -rf /tmp/xray*
 /usr/local/bin/xray version >/dev/null 2>&1 || error "Xray 安装失败"
 info "Xray 安装成功"
 
-# 生成密钥
+# 生成密钥（改进的方法，确保不为空）
 info "生成配置密钥..."
 USER_UUID=$(cat /proc/sys/kernel/random/uuid)
-KEY_OUTPUT=$(/usr/local/bin/xray x25519)
-PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep "Private key" | awk '{print $3}')
-PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep "Public key" | awk '{print $3}')
+
+# 生成 Reality 密钥对
+KEY_FILE=$(mktemp)
+/usr/local/bin/xray x25519 > "$KEY_FILE" 2>&1
+
+# 提取密钥，使用多种方法确保成功
+PRIVATE_KEY=$(cat "$KEY_FILE" | grep -i "private" | awk '{print $NF}' | tr -d '\r\n')
+PUBLIC_KEY=$(cat "$KEY_FILE" | grep -i "public" | awk '{print $NF}' | tr -d '\r\n')
+
+# 如果第一种方法失败，尝试第二种
+if [[ -z "$PRIVATE_KEY" ]]; then
+    PRIVATE_KEY=$(cat "$KEY_FILE" | grep -oP 'Private key:\s*\K\S+')
+    PUBLIC_KEY=$(cat "$KEY_FILE" | grep -oP 'Public key:\s*\K\S+')
+fi
+
+# 如果还是失败，尝试第三种
+if [[ -z "$PRIVATE_KEY" ]]; then
+    PRIVATE_KEY=$(cat "$KEY_FILE" | tail -2 | head -1 | awk '{print $1}')
+    PUBLIC_KEY=$(cat "$KEY_FILE" | tail -1 | awk '{print $1}')
+fi
+
+rm -f "$KEY_FILE"
+
+# 验证密钥
+if [[ -z "$PRIVATE_KEY" ]] || [[ ${#PRIVATE_KEY} -lt 40 ]]; then
+    error "私钥生成失败，请手动运行: /usr/local/bin/xray x25519"
+fi
+
+if [[ -z "$PUBLIC_KEY" ]] || [[ ${#PUBLIC_KEY} -lt 40 ]]; then
+    error "公钥生成失败，请手动运行: /usr/local/bin/xray x25519"
+fi
+
 SHORT_ID=$(openssl rand -hex 8)
+
+info "UUID: $USER_UUID"
+info "私钥: ${PRIVATE_KEY:0:20}..."
+info "公钥: ${PUBLIC_KEY:0:20}..."
+info "Short ID: $SHORT_ID"
 
 # 智能选择端口
 if netstat -tuln 2>/dev/null | grep -q ":443 " || ss -tuln 2>/dev/null | grep -q ":443 "; then
@@ -138,7 +168,6 @@ else
     LISTEN_PORT=443
 fi
 
-info "UUID: $USER_UUID"
 info "端口: $LISTEN_PORT"
 
 # 配置 Nginx
@@ -197,8 +226,8 @@ NGINX
 systemctl enable nginx >/dev/null 2>&1
 systemctl restart nginx >/dev/null 2>&1
 
-# 生成高性能 Xray 配置
-info "生成高性能 Xray 配置..."
+# 生成 Xray 配置
+info "生成 Xray 配置..."
 cat > "$XRAY_DIR/config.json" <<EOF
 {
     "log": {
@@ -209,12 +238,12 @@ cat > "$XRAY_DIR/config.json" <<EOF
     "inbounds": [
         {
             "listen": "0.0.0.0",
-            "port": $LISTEN_PORT,
+            "port": ${LISTEN_PORT},
             "protocol": "vless",
             "settings": {
                 "clients": [
                     {
-                        "id": "$USER_UUID",
+                        "id": "${USER_UUID}",
                         "flow": "xtls-rprx-vision"
                     }
                 ],
@@ -230,24 +259,21 @@ cat > "$XRAY_DIR/config.json" <<EOF
                 "security": "reality",
                 "realitySettings": {
                     "show": false,
-                    "dest": "$REALITY_DEST:$REALITY_PORT",
+                    "dest": "${REALITY_DEST}:${REALITY_PORT}",
                     "xver": 0,
                     "serverNames": [
-                        "$REALITY_DEST"
+                        "${REALITY_DEST}"
                     ],
-                    "privateKey": "$PRIVATE_KEY",
+                    "privateKey": "${PRIVATE_KEY}",
                     "shortIds": [
-                        "$SHORT_ID"
+                        "${SHORT_ID}"
                     ]
                 },
                 "sockopt": {
-                    "acceptProxyProtocol": false,
                     "tcpFastOpen": true,
-                    "tcpKeepAliveIdle": 100,
-                    "tcpKeepAliveInterval": 10,
                     "tcpNoDelay": true,
-                    "tcpUserTimeout": 10000,
-                    "mark": 255
+                    "tcpKeepAliveIdle": 100,
+                    "tcpKeepAliveInterval": 10
                 }
             },
             "sniffing": {
@@ -255,11 +281,8 @@ cat > "$XRAY_DIR/config.json" <<EOF
                 "destOverride": [
                     "http",
                     "tls",
-                    "quic",
-                    "fakedns"
-                ],
-                "metadataOnly": false,
-                "routeOnly": false
+                    "quic"
+                ]
             }
         }
     ],
@@ -272,10 +295,7 @@ cat > "$XRAY_DIR/config.json" <<EOF
             "streamSettings": {
                 "sockopt": {
                     "tcpFastOpen": true,
-                    "tcpNoDelay": true,
-                    "tcpKeepAliveIdle": 100,
-                    "tcpKeepAliveInterval": 10,
-                    "mark": 255
+                    "tcpNoDelay": true
                 }
             },
             "tag": "direct"
@@ -309,16 +329,8 @@ cat > "$XRAY_DIR/config.json" <<EOF
             "0": {
                 "handshake": 2,
                 "connIdle": 120,
-                "uplinkOnly": 1,
-                "downlinkOnly": 1,
                 "bufferSize": 4096
             }
-        },
-        "system": {
-            "statsInboundUplink": false,
-            "statsInboundDownlink": false,
-            "statsOutboundUplink": false,
-            "statsOutboundDownlink": false
         }
     }
 }
@@ -326,32 +338,22 @@ EOF
 
 info "配置文件生成完成"
 
-# 创建高性能服务
+# 创建服务
 info "创建 Xray 服务..."
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service (High Performance)
 Documentation=https://github.com/xtls/xray-core
-After=network.target network-online.target nss-lookup.target
+After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=/usr/local/bin/xray run -config $XRAY_DIR/config.json
+ExecStart=/usr/local/bin/xray run -config ${XRAY_DIR}/config.json
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
-LimitNPROC=512
-
-# 性能优化
-CPUSchedulingPolicy=other
-Nice=-10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=2
 
 [Install]
 WantedBy=multi-user.target
@@ -360,108 +362,50 @@ EOF
 systemctl daemon-reload
 systemctl enable xray >/dev/null 2>&1
 
-# 防火墙配置
+# 防火墙
 info "配置防火墙..."
 if command -v ufw >/dev/null 2>&1; then
     ufw allow 80/tcp >/dev/null 2>&1
-    ufw allow $LISTEN_PORT/tcp >/dev/null 2>&1
+    ufw allow ${LISTEN_PORT}/tcp >/dev/null 2>&1
 elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1
-    firewall-cmd --permanent --add-port=$LISTEN_PORT/tcp >/dev/null 2>&1
+    firewall-cmd --permanent --add-port=${LISTEN_PORT}/tcp >/dev/null 2>&1
     firewall-cmd --reload >/dev/null 2>&1
 fi
 
-# 系统性能优化（针对中国网络）
-info "优化系统性能（针对高延迟网络）..."
+# 系统优化
+info "优化系统性能..."
 
-# 备份现有配置
 cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%s) 2>/dev/null || true
-
-# 删除旧的优化配置
 sed -i '/# Xray 性能优化/,/^$/d' /etc/sysctl.conf 2>/dev/null || true
 
-cat >> /etc/sysctl.conf <<EOF
+cat >> /etc/sysctl.conf <<'EOF'
 
-# Xray 性能优化 - 中国网络专用 ($(date))
-
-# TCP 拥塞控制 - BBR
+# Xray 性能优化
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-
-# TCP 快速打开
 net.ipv4.tcp_fastopen=3
-
-# TCP 性能优化（针对高延迟）
 net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_keepalive_time=600
 net.ipv4.tcp_keepalive_intvl=10
 net.ipv4.tcp_keepalive_probes=6
 net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_fack=1
-net.ipv4.tcp_no_metrics_save=1
-net.ipv4.tcp_moderate_rcvbuf=1
-net.ipv4.tcp_syncookies=1
 net.ipv4.tcp_fin_timeout=15
 net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_max_tw_buckets=5000
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_synack_retries=2
-net.ipv4.tcp_syn_retries=2
-
-# 缓冲区优化（超大缓冲区，适合高延迟）
-net.core.rmem_default=1048576
 net.core.rmem_max=536870912
-net.core.wmem_default=1048576
 net.core.wmem_max=536870912
-net.core.netdev_max_backlog=250000
-net.core.somaxconn=65535
 net.ipv4.tcp_rmem=8192 262144 536870912
 net.ipv4.tcp_wmem=4096 16384 536870912
-net.ipv4.tcp_mem=786432 2097152 3145728
-net.ipv4.udp_rmem_min=16384
-net.ipv4.udp_wmem_min=16384
-
-# 连接数优化
+net.core.netdev_max_backlog=250000
+net.core.somaxconn=65535
 fs.file-max=1048576
 net.ipv4.ip_local_port_range=1024 65535
-net.nf_conntrack_max=1000000
-net.netfilter.nf_conntrack_max=1000000
-net.netfilter.nf_conntrack_tcp_timeout_established=600
-
-# 路由优化
 net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-net.ipv4.conf.all.route_localnet=1
-
-# 安全优化
-net.ipv4.conf.all.rp_filter=1
-net.ipv4.conf.default.rp_filter=1
-net.ipv4.icmp_echo_ignore_broadcasts=1
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv4.icmp_ignore_bogus_error_responses=1
-
-# 系统优化
 vm.swappiness=10
-vm.overcommit_memory=1
-kernel.pid_max=4194304
 EOF
 
 sysctl -p >/dev/null 2>&1
-info "BBR 和系统优化已启用"
-
-# 设置文件限制
-cat > /etc/security/limits.d/xray.conf <<EOF
-* soft nofile 1048576
-* hard nofile 1048576
-* soft nproc 1048576
-* hard nproc 1048576
-EOF
+info "系统优化完成"
 
 # 启动服务
 info "启动 Xray 服务..."
@@ -469,9 +413,7 @@ systemctl start xray
 sleep 3
 
 if ! systemctl is-active --quiet xray; then
-    warn "Xray 可能启动失败，查看日志..."
-    journalctl -u xray -n 30 --no-pager
-    error "服务启动失败"
+    error "Xray 启动失败，查看日志: journalctl -u xray -n 50"
 fi
 
 info "Xray 服务运行正常"
@@ -480,66 +422,45 @@ info "Xray 服务运行正常"
 info "生成客户端配置..."
 mkdir -p "$CLIENT_DIR"
 
-# 生成分享链接
-SHARE_LINK="vless://${USER_UUID}@${SERVER_IP}:${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DEST}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Reality-HighSpeed-${REALITY_DEST%%.*}"
+SHARE_LINK="vless://${USER_UUID}@${SERVER_IP}:${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DEST}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Reality-${REALITY_DEST%%.*}"
 
 cat > "$CLIENT_DIR/config.txt" <<EOF
 ╔════════════════════════════════════════════════════╗
-║      VLESS Reality 高速优化版配置信息              ║
+║      VLESS Reality 配置信息（完全修复版）          ║
 ╚════════════════════════════════════════════════════╝
 
 【连接信息】
-服务器地址: $SERVER_IP
-端口: $LISTEN_PORT
-UUID: $USER_UUID
-传输协议: tcp
-流控: xtls-rprx-vision (必选!)
-安全类型: reality
-SNI: $REALITY_DEST
-Fingerprint: chrome
-公钥: $PUBLIC_KEY
-Short ID: $SHORT_ID
+服务器: ${SERVER_IP}
+端口: ${LISTEN_PORT}
+UUID: ${USER_UUID}
+流控: xtls-rprx-vision (必须!)
+传输: tcp
+安全: reality
+SNI: ${REALITY_DEST}
+指纹: chrome
+公钥: ${PUBLIC_KEY}
+Short ID: ${SHORT_ID}
 
 【性能优化】
-✓ XTLS Vision 流控 - 提速 50%+
-✓ BBR 拥塞控制 - 高丢包优化
-✓ 超大缓冲区 - 512MB
-✓ TCP 快速重传 - 降低延迟
-✓ 针对中国网络优化
+✓ XTLS Vision 流控
+✓ BBR 拥塞控制
+✓ 超大缓冲区 512MB
+✓ TCP 快速重传
 ✓ 连接保活机制
 
-【客户端设置（重要！）】
+【客户端设置（重要）】
 1. 流控: xtls-rprx-vision (必选!)
-2. Mux 多路复用: 关闭
+2. Mux: 关闭 (必须!)
 3. 允许不安全: 开启
-4. 分流模式: 建议启用
 
 【推荐客户端】
-• Windows: v2rayN 6.0+
-• Android: v2rayNG 1.8.5+ / NekoBox
-• iOS: Shadowrocket 最新版
-• macOS: V2RayXS / FoXray
-
-【速度优化建议】
-1. 确保客户端是最新版本
-2. 关闭 Mux 多路复用
-3. 使用分流规则（国内直连）
-4. 避开晚高峰（19:00-23:00）
-5. 测试 YouTube 4K 检验速度
-
-【故障排查】
-速度慢：
-- 检查流控是否为 xtls-rprx-vision
-- 关闭 Mux
-- 更换客户端
-
-经常断线：
-- 检查 VPS 网络
-- 运行: vless test
-- 查看日志: vless log
+Windows: v2rayN 6.0+
+Android: v2rayNG 1.8.5+ / NekoBox
+iOS: Shadowrocket
+macOS: V2RayXS
 
 【分享链接】
-$SHARE_LINK
+${SHARE_LINK}
 
 生成时间: $(date)
 EOF
@@ -550,7 +471,7 @@ if command -v qrencode >/dev/null 2>&1; then
     qrencode -t ANSIUTF8 "$SHARE_LINK" > "$CLIENT_DIR/qr.txt" 2>/dev/null
 fi
 
-# 创建管理脚本
+# 管理脚本
 cat > /usr/local/bin/vless <<'SCRIPT'
 #!/bin/bash
 GREEN='\033[0;32m'
@@ -566,26 +487,21 @@ case "$1" in
         ;;
     stop) 
         systemctl stop xray nginx
-        echo -e "${YELLOW}! 服务已停止${NC}"
+        echo -e "${YELLOW}服务已停止${NC}"
         ;;
     restart) 
         systemctl restart xray nginx
-        echo -e "${GREEN}✓ 服务已重启${NC}"
         sleep 2
-        systemctl is-active --quiet xray && echo -e "${GREEN}✓ Xray 运行正常${NC}" || echo -e "${RED}✗ Xray 未运行${NC}"
+        systemctl is-active --quiet xray && echo -e "${GREEN}✓ 重启成功${NC}" || echo -e "${RED}✗ 重启失败${NC}"
         ;;
     status) 
-        echo -e "${CYAN}=== Xray 状态 ===${NC}"
-        systemctl status xray --no-pager -l
+        echo -e "${CYAN}=== Xray ===${NC}"
+        systemctl status xray --no-pager
         echo ""
-        echo -e "${CYAN}=== Nginx 状态 ===${NC}"
-        systemctl status nginx --no-pager -l
-        echo ""
-        echo -e "${CYAN}=== 网络状态 ===${NC}"
-        ss -s
+        echo -e "${CYAN}=== Nginx ===${NC}"
+        systemctl status nginx --no-pager
         ;;
     log) 
-        echo -e "${CYAN}查看 Xray 实时日志 (Ctrl+C 退出)${NC}"
         journalctl -u xray -f
         ;;
     config) 
@@ -595,129 +511,63 @@ case "$1" in
         cat /root/vless-clients/link.txt
         ;;
     qr) 
-        if [[ -f /root/vless-clients/qr.txt ]]; then
-            cat /root/vless-clients/qr.txt
-        else
-            echo -e "${YELLOW}二维码文件不存在${NC}"
-        fi
+        [[ -f /root/vless-clients/qr.txt ]] && cat /root/vless-clients/qr.txt || echo "二维码不存在"
         ;;
     test)
-        echo -e "${CYAN}【系统测试】${NC}"
+        echo -e "${CYAN}【服务测试】${NC}"
         echo ""
-        echo "1. 服务状态:"
-        systemctl is-active xray >/dev/null && echo -e "   ${GREEN}✓ Xray 运行中${NC}" || echo -e "   ${RED}✗ Xray 未运行${NC}"
-        systemctl is-active nginx >/dev/null && echo -e "   ${GREEN}✓ Nginx 运行中${NC}" || echo -e "   ${RED}✗ Nginx 未运行${NC}"
+        systemctl is-active xray >/dev/null && echo -e "${GREEN}✓ Xray 运行${NC}" || echo -e "${RED}✗ Xray 未运行${NC}"
+        systemctl is-active nginx >/dev/null && echo -e "${GREEN}✓ Nginx 运行${NC}" || echo -e "${RED}✗ Nginx 未运行${NC}"
         echo ""
-        echo "2. BBR 状态:"
-        BBR=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
-        if [[ "$BBR" == "bbr" ]]; then
-            echo -e "   ${GREEN}✓ BBR 已启用${NC}"
-        else
-            echo -e "   ${RED}✗ BBR 未启用 (当前: $BBR)${NC}"
-        fi
-        echo ""
-        echo "3. 端口监听:"
-        PORT=$(grep '"port"' /usr/local/etc/xray/config.json | head -1 | grep -oP '\d+')
-        if ss -tlnp | grep -q ":$PORT "; then
-            echo -e "   ${GREEN}✓ 端口 $PORT 正常监听${NC}"
-        else
-            echo -e "   ${RED}✗ 端口 $PORT 未监听${NC}"
-        fi
-        echo ""
-        echo "4. 连接统计:"
-        ss -s
-        echo ""
-        echo "5. 系统负载:"
-        uptime
-        ;;
-    bbr)
-        echo -e "${CYAN}【BBR 状态检查】${NC}"
-        echo ""
-        echo "当前拥塞控制算法:"
+        echo "BBR 状态:"
         sysctl net.ipv4.tcp_congestion_control
-        echo ""
-        echo "可用算法:"
-        sysctl net.ipv4.tcp_available_congestion_control
-        echo ""
-        if lsmod | grep -q bbr; then
-            echo -e "${GREEN}✓ BBR 模块已加载${NC}"
-        else
-            echo -e "${YELLOW}! BBR 模块未加载${NC}"
-        fi
-        ;;
-    optimize)
-        echo -e "${CYAN}【重新优化系统】${NC}"
-        sysctl -p
-        systemctl restart xray
-        echo -e "${GREEN}✓ 优化完成${NC}"
         ;;
     *)
-        echo -e "${CYAN}╔═══════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║   VLESS Reality 管理工具 (高速版)    ║${NC}"
-        echo -e "${CYAN}╚═══════════════════════════════════════╝${NC}"
+        echo -e "${CYAN}VLESS Reality 管理工具${NC}"
         echo ""
         echo "用法: vless [命令]"
         echo ""
-        echo "  start    - 启动服务"
-        echo "  stop     - 停止服务"
-        echo "  restart  - 重启服务"
-        echo "  status   - 查看状态"
-        echo "  log      - 查看实时日志"
-        echo "  config   - 显示配置信息"
-        echo "  link     - 显示分享链接"
-        echo "  qr       - 显示二维码"
-        echo "  test     - 测试服务和性能"
-        echo "  bbr      - 检查 BBR 状态"
-        echo "  optimize - 重新优化系统"
-        echo ""
+        echo "  start   - 启动"
+        echo "  stop    - 停止"
+        echo "  restart - 重启"
+        echo "  status  - 状态"
+        echo "  log     - 日志"
+        echo "  config  - 配置"
+        echo "  link    - 链接"
+        echo "  qr      - 二维码"
+        echo "  test    - 测试"
         ;;
 esac
 SCRIPT
 
 chmod +x /usr/local/bin/vless
 
-# 最终测试
-info "测试服务状态..."
-sleep 2
-
-if systemctl is-active --quiet xray; then
-    info "服务测试通过"
-else
-    warn "服务可能存在问题"
-fi
-
 # 显示结果
 clear
 echo ""
 echo -e "${GREEN}╔═══════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║     安装成功！(终极速度优化版)           ║${NC}"
+echo -e "${GREEN}║     安装成功！(完全修复版)               ║${NC}"
 echo -e "${GREEN}╚═══════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "${CYAN}【服务器信息】${NC}"
-echo "  IP: $SERVER_IP"
-echo "  端口: $LISTEN_PORT"
-echo "  UUID: $USER_UUID"
-echo "  伪装站: http://$SERVER_IP"
+echo "  IP: ${SERVER_IP}"
+echo "  端口: ${LISTEN_PORT}"
+echo "  UUID: ${USER_UUID}"
 echo ""
 echo -e "${CYAN}【性能优化】${NC}"
-echo "  ✓ XTLS Vision 流控 (提速 50%+)"
-echo "  ✓ BBR 拥塞控制 (高丢包优化)"
-echo "  ✓ 超大缓冲区 512MB (提高吞吐)"
-echo "  ✓ TCP 快速重传 (降低延迟)"
-echo "  ✓ 连接保活优化 (防断线)"
-echo "  ✓ 针对中国网络深度优化"
+echo "  ✓ XTLS Vision 流控"
+echo "  ✓ BBR 拥塞控制"
+echo "  ✓ 超大缓冲区"
+echo "  ✓ 连接保活"
 echo ""
 echo -e "${CYAN}【重要提醒】${NC}"
-echo "  ⚠ 客户端流控必须选: xtls-rprx-vision"
-echo "  ⚠ 必须关闭 Mux 多路复用"
-echo "  ⚠ 建议使用分流规则（国内直连）"
+echo "  ⚠ 流控必须: xtls-rprx-vision"
+echo "  ⚠ Mux 必须: 关闭"
 echo ""
 echo -e "${CYAN}【管理命令】${NC}"
-echo "  vless config  - 查看完整配置"
-echo "  vless link    - 显示分享链接"
-echo "  vless test    - 测试性能"
-echo "  vless status  - 查看状态"
-echo "  vless bbr     - 检查 BBR"
+echo "  vless config - 查看配置"
+echo "  vless link   - 分享链接"
+echo "  vless test   - 测试服务"
 echo ""
 
 if [[ -f "$CLIENT_DIR/qr.txt" ]]; then
@@ -730,14 +580,6 @@ echo -e "${CYAN}【分享链接】${NC}"
 cat "$CLIENT_DIR/link.txt"
 echo ""
 
-echo -e "${CYAN}【预期性能】${NC}"
-echo "  • YouTube 4K: 流畅播放"
-echo "  • 下载速度: 50-500 Mbps (取决于VPS带宽)"
-echo "  • 网页加载: < 1秒"
-echo "  • 连接延迟: 80-200ms"
-echo ""
-
-info "配置文件: $CLIENT_DIR/config.txt"
-info "运行 'vless test' 测试服务"
-info "运行 'vless bbr' 检查 BBR 状态"
+info "配置文件: ${CLIENT_DIR}/config.txt"
+info "测试命令: vless test"
 echo ""
